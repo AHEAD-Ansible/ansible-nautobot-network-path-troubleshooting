@@ -1,0 +1,6 @@
+---
+- name: Trace from each source to the destination
+  hosts: traceroute_sources
+  gather_facts: false
+  roles:
+    - role: netpath

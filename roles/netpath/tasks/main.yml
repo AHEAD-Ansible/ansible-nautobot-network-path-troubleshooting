@@ -1,0 +1,47 @@
+---
+# Ensures traceroute is present, runs custom traceroute module,
+# converts the hop list into the requested JSON structure, and
+# prints the JSON at the end of the play.
+
+
+- name: Ensure traceroute is installed on source host
+  package:
+    name: traceroute
+    state: present
+
+- name: Run traceroute from source to destination (custom module)
+  traceroute_path:
+    source: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    destination: "{{ netpath_destination }}"
+  register: traceroute_output
+
+- name: Show raw traceroute output
+  debug:
+    var: traceroute_output.raw_output
+
+- name: Structure hop list as JSON (ECMP-aware, unresolved hops preserved)
+  hop_path_to_json:
+    hop_ips_by_hop: "{{ traceroute_output.hop_ips_by_hop }}"
+  register: hop_json
+
+- name: Output path JSON (pretty)
+  debug:
+    var: hop_json.json
+
+
+# Save JSON to local file on the Ansible controller
+- name: Ensure local artifacts dir exists
+  file:
+    path: "./artifacts"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+
+- name: Write hop JSON to local file
+  copy:
+    content: "{{ hop_json.json }}"
+    dest: "./artifacts/{{ inventory_hostname }}__to__{{ (netpath_destination | regex_replace('[^A-Za-z0-9_.-]+','_')) }}.json"
+    mode: '0644'
+  delegate_to: localhost

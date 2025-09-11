@@ -1,0 +1,13 @@
+# SSH creds for all hosts (PLAINTEXT FOR DEMO — use ansible-vault in real life)
+ansible_user: ansible
+ansible_password: Labl@b1234
+ansible_connection: ssh
+# If sudo is ever needed:
+# ansible_become: true
+# ansible_become_method: sudo
+# ansible_become_password: demo_password
+
+
+# Destination to trace to (can be overridden with -e "netpath_destination=1.1.1.1")
+# netpath_destination: 10.200.200.200
+netpath_destination: 8.8.8.8
