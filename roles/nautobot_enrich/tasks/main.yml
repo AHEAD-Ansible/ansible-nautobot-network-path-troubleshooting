@@ -1,0 +1,56 @@
+---
+# Assumes the networktocode.nautobot collection is installed.
+
+- name: Validate input structure
+  ansible.builtin.assert:
+    that:
+      - netpath_hops is iterable
+      - netpath_hops is not string
+    fail_msg: >
+      netpath_hops must be a list like:
+      [{'hop': <int>, 'devices': [{'ip': <str>}, ...]}, ...]
+    success_msg: "netpath_hops input looks valid."
+  delegate_to: localhost
+  run_once: true
+
+- name: Ensure local artifacts dir exists
+  ansible.builtin.file:
+    path: "{{ nautobot_enrich_artifacts_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+
+- name: Initialize enriched_hops (controller-local)
+  ansible.builtin.set_fact:
+    enriched_hops: []
+  delegate_to: localhost
+  run_once: true
+
+# Iterate per-hop via include_tasks (avoid loops on blocks)
+- name: Process each hop
+  ansible.builtin.include_tasks: process_hop.yml
+  loop: "{{ netpath_hops }}"
+  loop_control:
+    loop_var: hop
+    label: "hop {{ hop.hop }}"
+
+- name: Build enriched JSON (pretty)
+  ansible.builtin.set_fact:
+    enriched_json: "{{ {'hops': enriched_hops} | to_nice_json }}"
+  delegate_to: localhost
+
+- name: Show enriched JSON
+  ansible.builtin.debug:
+    var: enriched_json
+
+- name: Save enriched JSON next to previous artifact
+  vars:
+    dest_sanitized: "{{ (netpath_destination | default('destination') | regex_replace('[^A-Za-z0-9_.-]+','_')) }}"
+  ansible.builtin.copy:
+    content: "{{ enriched_json }}"
+    dest: "{{ nautobot_enrich_artifacts_dir }}/{{ inventory_hostname }}__to__{{ dest_sanitized }}__enriched.json"
+    mode: '0644'
+  delegate_to: localhost
+
+

@@ -1,0 +1,23 @@
+---
+# Expects variable 'hop' from parent include_tasks:
+# hop: { hop: <int>, devices: [ {ip: "<addr>"} , ... ] }
+
+- name: Reset per-hop device accumulator
+  ansible.builtin.set_fact:
+    tmp_devices: []
+  delegate_to: localhost
+
+# For hops with devices, enrich each device by including a device task file.
+- name: Enrich each device for hop {{ hop.hop }}
+  ansible.builtin.include_tasks: process_device.yml
+  loop: "{{ hop.devices | default([]) }}"
+  loop_control:
+    loop_var: dev
+    label: "{{ dev.ip }}"
+  when: hop.devices | default([]) | length > 0
+
+- name: Append hop {{ hop.hop }} to enriched_hops
+  ansible.builtin.set_fact:
+    enriched_hops: "{{ (enriched_hops | default([])) + [ {'hop': hop.hop, 'devices': (tmp_devices | default([])) } ] }}"
+  delegate_to: localhost
+
