@@ -2,7 +2,7 @@
 - name: Trace from each source to the destination, then enrich via Nautobot
   hosts: traceroute_sources
   gather_facts: false
-
+  any_errors_fatal: true
   roles:
     - role: netpath
     - role: nautobot_enrich

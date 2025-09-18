@@ -3,6 +3,20 @@
 # converts the hop list into the requested JSON structure, and
 # prints the JSON at the end of the play.
 
+- name: Check reachability with ping from source to destination (custom module)
+  ping_check:
+    source: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    destination: "{{ netpath_destination }}"
+    count: 10
+    timeout: 1
+    interval: 0.2          # optional
+    stop_on_first_success: true
+  register: ping_result
+
+- name: Show per-attempt results (seq, success, rtt)
+  debug:
+    msg: "{{ ping_result.attempts | to_nice_json }}"
+
 
 - name: Ensure traceroute is installed on source host
   package:
