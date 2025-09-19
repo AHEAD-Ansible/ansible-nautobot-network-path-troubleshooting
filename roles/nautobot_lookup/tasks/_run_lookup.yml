@@ -1,0 +1,70 @@
+---
+# Internal helper to perform a Nautobot lookup and normalize the response.
+# Expected vars:
+#   nautobot_lookup_resource: API resource string (e.g. 'ip-addresses').
+#   nautobot_lookup_filters: list of "key=value" fragments.
+# Optional vars:
+#   nautobot_lookup_depth_value: override depth value (None to omit).
+#   nautobot_lookup_num_retries: retry count (defaults via role defaults).
+#   nautobot_lookup_validate_certs: whether to validate TLS certs.
+
+- name: Validate Nautobot lookup inputs
+  ansible.builtin.assert:
+    that:
+      - nautobot_lookup_resource is defined
+      - nautobot_lookup_resource | length > 0
+      - nautobot_lookup_filters is defined
+      - nautobot_lookup_filters | length > 0
+      - nautobot_url is defined
+      - nautobot_token is defined
+    fail_msg: "Missing required Nautobot lookup inputs."
+
+- name: Compose Nautobot API filter string
+  vars:
+    _base_filters: "{{ nautobot_lookup_filters | join(' ') }}"
+    _depth_value: >-
+      {{
+        nautobot_lookup_depth_value
+        if (nautobot_lookup_depth_value is defined)
+        else (nautobot_lookup_default_depth if (nautobot_lookup_default_depth is defined) else none)
+      }}
+    _depth_suffix: "{{ ' depth=' ~ _depth_value if _depth_value is not none else '' }}"
+  ansible.builtin.set_fact:
+    nautobot_lookup__filter_string: "{{ (_base_filters ~ _depth_suffix) | trim }}"
+
+- name: Execute Nautobot lookup
+  vars:
+    _raw: >-
+      {{
+        lookup(
+          'networktocode.nautobot.lookup',
+          nautobot_lookup_resource,
+          api_filter=nautobot_lookup__filter_string,
+          api_endpoint=nautobot_url,
+          token=nautobot_token,
+          raw_data=True,
+          num_retries=nautobot_lookup_num_retries,
+          validate_certs=nautobot_lookup_validate_certs
+        )
+        | default({})
+      }}
+  ansible.builtin.set_fact:
+    nautobot_lookup_raw: "{{ _raw }}"
+
+- name: Normalize Nautobot lookup results
+  ansible.builtin.set_fact:
+    nautobot_lookup_list: >-
+      {{
+        [nautobot_lookup_raw]
+        if (nautobot_lookup_raw is mapping)
+        else (
+          nautobot_lookup_raw
+          if (nautobot_lookup_raw is iterable and not (nautobot_lookup_raw is string))
+          else []
+        )
+      }}
+
+- name: Capture primary Nautobot lookup object
+  ansible.builtin.set_fact:
+    nautobot_lookup_object: "{{ nautobot_lookup_list[0] if (nautobot_lookup_list | length) > 0 else {} }}"
+    nautobot_lookup_found: "{{ (nautobot_lookup_list | length) > 0 }}"

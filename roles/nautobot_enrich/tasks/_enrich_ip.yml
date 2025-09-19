@@ -1,0 +1,145 @@
+---
+# Internal helper that enriches a single IP using Nautobot lookups.
+# Expects:
+#   enrich_target_ip: IP address to enrich.
+# Optional:
+#   enrich_lookup_namespace: namespace filter override.
+#   enrich_lookup_depth: depth override for lookups.
+#   enrich_include: map of fields to include (same schema as nautobot_enrich_include).
+
+- name: Validate IP input
+  ansible.builtin.assert:
+    that:
+      - enrich_target_ip is defined
+      - enrich_target_ip | length > 0
+    fail_msg: "enrich_target_ip must be provided for Nautobot enrichment"
+  delegate_to: localhost
+
+- name: Reset enriched device holder
+  ansible.builtin.set_fact:
+    _enriched_device: {}
+  delegate_to: localhost
+
+- name: Build enrichment for {{ enrich_target_ip }}
+  vars:
+    _lookup_namespace: "{{ enrich_lookup_namespace | default(nautobot_namespace | default(omit), true) }}"
+    _lookup_depth: "{{ enrich_lookup_depth | default(nautobot_depth | default(omit), true) }}"
+    _inc: "{{ enrich_include | default(nautobot_enrich_include | default({'device_name': true, 'interface_name': true, 'device_id': false, 'interface_id': false, 'platform': true})) }}"
+  block:
+    - name: Run IP lookup
+      ansible.builtin.include_role:
+        name: nautobot_lookup
+        tasks_from: ip_address
+      vars:
+        nautobot_lookup_ip: "{{ enrich_target_ip }}"
+        nautobot_lookup_namespace: "{{ _lookup_namespace | default(omit, true) }}"
+        nautobot_lookup_depth: "{{ _lookup_depth | default(omit, true) }}"
+
+    - name: Capture IP related objects
+      ansible.builtin.set_fact:
+        _nb_ip: "{{ nautobot_lookup_object | default({}, true) }}"
+        _nb_assigned: "{{ (nautobot_lookup_object.assigned_object if (nautobot_lookup_object is defined and nautobot_lookup_object.assigned_object is defined) else {}) | default({}, true) }}"
+        _nb_interfaces_raw: "{{ (nautobot_lookup_object.interfaces if (nautobot_lookup_object is defined and nautobot_lookup_object.interfaces is defined) else []) | default([], true) }}"
+
+    - name: Normalize interface list
+      ansible.builtin.set_fact:
+        _nb_interfaces: >-
+          {{
+            _nb_interfaces_raw
+            if (_nb_interfaces_raw is iterable and not (_nb_interfaces_raw is string))
+            else []
+          }}
+
+    - name: Determine primary interface and device candidates
+      vars:
+        _nb_primary_interface: "{{ (_nb_interfaces | first) | default({}, true) }}"
+      ansible.builtin.set_fact:
+        _nb_interface: >-
+          {{
+            _nb_assigned
+            if (_nb_assigned is mapping and (_nb_assigned.name is defined or _nb_assigned.id is defined))
+            else (_nb_primary_interface if (_nb_primary_interface is mapping) else {})
+          }}
+        _nb_device: >-
+          {{
+            _nb_assigned.device
+            if (_nb_assigned is mapping and _nb_assigned.device is defined and _nb_assigned.device)
+            else (
+              _nb_primary_interface.device
+              if (_nb_primary_interface is mapping and _nb_primary_interface.device is defined and _nb_primary_interface.device)
+              else {}
+            )
+          }}
+
+    - name: Capture identifiers for downstream lookups
+      ansible.builtin.set_fact:
+        _nb_device_id: "{{ (_nb_device.id | default('', true)) | string }}"
+        _nb_platform_ref: "{{ _nb_device.platform | default({}, true) }}"
+
+    - name: Fetch Nautobot device details when platform missing
+      when:
+        - _nb_device_id != ''
+        - _nb_device.platform is not defined or _nb_device.platform in [None, {}, '']
+      block:
+        - name: Lookup device by ID
+          ansible.builtin.include_role:
+            name: nautobot_lookup
+            tasks_from: device
+          vars:
+            nautobot_lookup_device_filters:
+              - "id={{ _nb_device_id }}"
+            nautobot_lookup_depth: "{{ _lookup_depth | default(omit, true) }}"
+
+        - name: Update device reference from lookup
+          when: nautobot_lookup_found | default(false)
+          ansible.builtin.set_fact:
+            _nb_device: "{{ nautobot_lookup_object }}"
+            _nb_platform_ref: "{{ nautobot_lookup_object.platform | default({}, true) }}"
+
+    - name: Lookup platform details when name unavailable
+      when:
+        - _nb_platform_ref is mapping
+        - (_nb_platform_ref.name is not defined) or (_nb_platform_ref.name in [None, ''])
+        - _nb_platform_ref.id is defined
+        - (_nb_platform_ref.id | string) | length > 0
+      block:
+        - name: Query Nautobot platform by ID
+          ansible.builtin.include_role:
+            name: nautobot_lookup
+            tasks_from: platform
+          vars:
+            nautobot_lookup_platform_id: "{{ _nb_platform_ref.id }}"
+            nautobot_lookup_depth: "{{ _lookup_depth | default(omit, true) }}"
+
+        - name: Update platform reference from lookup
+          when: nautobot_lookup_found | default(false)
+          ansible.builtin.set_fact:
+            _nb_platform_ref: "{{ nautobot_lookup_object }}"
+
+    - name: Normalize enriched attributes
+      vars:
+        _interface_id: "{{ _nb_interface.id | default('', true) }}"
+        _platform_value: >-
+          {{
+            (
+              _nb_platform_ref.name
+              if (_nb_platform_ref is mapping and _nb_platform_ref.name is defined and _nb_platform_ref.name not in [None, ''])
+              else (
+                _nb_platform_ref
+                if (_nb_platform_ref is string)
+                else ''
+              )
+            )
+            | default('', true)
+          }}
+      ansible.builtin.set_fact:
+        _enriched_device: >-
+          {{
+            {'ip': enrich_target_ip}
+            | combine( {'platform': _platform_value} if (_inc.platform | default(true)) else {} )
+            | combine( {'device_name': (_nb_device.name | default('', true))} if (_inc.device_name | default(true)) and ((_nb_device.name | default('', true)) | length > 0) else {} )
+            | combine( {'interface_name': (_nb_interface.name | default('', true))} if (_inc.interface_name | default(true)) and ((_nb_interface.name | default('', true)) | length > 0) else {} )
+            | combine( {'device_id': _nb_device_id} if (_inc.device_id | default(false)) and (_nb_device_id | length > 0) else {} )
+            | combine( {'interface_id': _interface_id} if (_inc.interface_id | default(false)) and (_interface_id | length > 0) else {} )
+          }}
+  delegate_to: localhost

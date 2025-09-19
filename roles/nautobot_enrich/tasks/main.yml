@@ -27,6 +27,12 @@
   delegate_to: localhost
   run_once: true
 
+- name: Initialize endpoint enrichment placeholders
+  ansible.builtin.set_fact:
+    enriched_source: {}
+    enriched_destination: {}
+  delegate_to: localhost
+
 # Iterate per-hop via include_tasks (avoid loops on blocks)
 - name: Process each hop
   ansible.builtin.include_tasks: process_hop.yml
@@ -35,9 +41,40 @@
     loop_var: hop
     label: "hop {{ hop.hop }}"
 
-- name: Build enriched JSON (pretty)
+- name: Enrich source endpoint
+  ansible.builtin.include_tasks: _enrich_ip.yml
+  vars:
+    enrich_target_ip: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+    enrich_include: "{{ nautobot_enrich_include | default(omit, true) }}"
+    enrich_lookup_namespace: "{{ nautobot_namespace | default(omit, true) }}"
+    enrich_lookup_depth: "{{ nautobot_depth | default(omit, true) }}"
+
+- name: Store source enrichment
   ansible.builtin.set_fact:
-    enriched_json: "{{ {'hops': enriched_hops} | to_nice_json }}"
+    enriched_source: "{{ _enriched_device | default({'ip': (hostvars[inventory_hostname].ansible_host | default(inventory_hostname))}) }}"
+  delegate_to: localhost
+
+- name: Enrich destination endpoint
+  ansible.builtin.include_tasks: _enrich_ip.yml
+  vars:
+    enrich_target_ip: "{{ netpath_destination }}"
+    enrich_include: "{{ nautobot_enrich_include | default(omit, true) }}"
+    enrich_lookup_namespace: "{{ nautobot_namespace | default(omit, true) }}"
+    enrich_lookup_depth: "{{ nautobot_depth | default(omit, true) }}"
+
+- name: Store destination enrichment
+  ansible.builtin.set_fact:
+    enriched_destination: "{{ _enriched_device | default({'ip': netpath_destination}) }}"
+  delegate_to: localhost
+
+- name: Build enriched payload structure
+  ansible.builtin.set_fact:
+    enriched_payload: "{{ {'source': enriched_source | default({}, true), 'destination': enriched_destination | default({}, true), 'hops': enriched_hops} }}"
+  delegate_to: localhost
+
+- name: Render enriched JSON (pretty)
+  ansible.builtin.set_fact:
+    enriched_json: "{{ enriched_payload | to_nice_json }}"
   delegate_to: localhost
 
 - name: Show enriched JSON
@@ -52,5 +89,3 @@
     dest: "{{ nautobot_enrich_artifacts_dir }}/{{ inventory_hostname }}__to__{{ dest_sanitized }}__enriched.json"
     mode: '0644'
   delegate_to: localhost
-
-

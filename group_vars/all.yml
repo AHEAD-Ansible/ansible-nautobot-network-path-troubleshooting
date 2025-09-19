@@ -26,4 +26,5 @@ nautobot_enrich_include:
   interface_name: true
   device_id: false
   interface_id: false
+  platform: true
   # site_name: true   # example if you add it

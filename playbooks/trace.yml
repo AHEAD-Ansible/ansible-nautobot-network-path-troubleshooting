@@ -1,4 +1,6 @@
 ---
+# Entry point playbook that runs discovery via `netpath` and hands the hop list
+# to `nautobot_enrich` for metadata augmentation.
 - name: Trace from each source to the destination, then enrich via Nautobot
   hosts: traceroute_sources
   gather_facts: false
