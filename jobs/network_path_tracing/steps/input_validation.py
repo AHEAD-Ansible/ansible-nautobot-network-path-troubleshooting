@@ -56,7 +56,6 @@ class InputValidationStep:
             raise InputValidationError(f"Missing {role} IP address")
 
         try:
-            # Preserve canonical host formatting (no netmask).
             return str(ipaddress.ip_address(candidate.split("/")[0]))
         except ValueError as exc:
             raise InputValidationError(f"Invalid {role} IP '{candidate}': {exc}") from exc
