@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from typing import Optional
 
+
 _DEFAULT_SOURCE_IP = "10.100.100.100"
 _DEFAULT_DESTINATION_IP = "10.200.200.200"
 _DEFAULT_GATEWAY_CUSTOM_FIELD = "network_gateway"
@@ -21,12 +22,13 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 @dataclass(frozen=True)
 class NautobotAPISettings:
-    """Settings that describe how to reach the Nautobot REST API."""
+    """Settings for reaching the Nautobot REST API."""
     base_url: str = os.getenv("NAUTOBOT_API_URL", "http://192.168.100.10:8085/")
     token: str = os.getenv("NAUTOBOT_API_TOKEN", "0123456789abcdef0123456789abcdef01234567")
     verify_ssl: bool = _env_flag("NAUTOBOT_API_VERIFY_SSL", False)
 
     def is_configured(self) -> bool:
+        """Check if API settings are valid."""
         return bool(self.base_url and self.token)
 
 
@@ -38,6 +40,7 @@ class PaloAltoSettings:
     verify_ssl: bool = _env_flag("PA_VERIFY_SSL", False)
 
     def is_configured(self) -> bool:
+        """Check if Palo Alto credentials are valid."""
         return bool(self.username and self.password)
 
 
@@ -48,12 +51,13 @@ class NapalmSettings:
     password: str = os.getenv("NAPALM_PASSWORD", "")
 
     def is_configured(self) -> bool:
+        """Check if NAPALM credentials are valid."""
         return bool(self.username and self.password)
 
 
 @dataclass(frozen=True)
 class NetworkPathSettings:
-    """Container for runtime settings used by the path tracing workflow."""
+    """Runtime settings for the path tracing workflow."""
     source_ip: str = os.getenv("NETWORK_PATH_SOURCE_IP", _DEFAULT_SOURCE_IP)
     destination_ip: str = os.getenv("NETWORK_PATH_DESTINATION_IP", _DEFAULT_DESTINATION_IP)
     api: NautobotAPISettings = NautobotAPISettings()
@@ -62,19 +66,17 @@ class NetworkPathSettings:
     napalm: NapalmSettings = NapalmSettings()
 
     def as_tuple(self) -> tuple[str, str]:
+        """Return source and destination IPs as a tuple."""
         return self.source_ip, self.destination_ip
 
     def api_settings(self) -> Optional[NautobotAPISettings]:
-        if self.api.is_configured():
-            return self.api
-        return None
+        """Return API settings if configured, else None."""
+        return self.api if self.api.is_configured() else None
 
     def pa_settings(self) -> Optional[PaloAltoSettings]:
-        if self.pa.is_configured():
-            return self.pa
-        return None
+        """Return Palo Alto settings if configured, else None."""
+        return self.pa if self.pa.is_configured() else None
 
     def napalm_settings(self) -> Optional[NapalmSettings]:
-        if self.napalm.is_configured():
-            return self.napalm
-        return None
+        """Return NAPALM settings if configured, else None."""
+        return self.napalm if self.napalm.is_configured() else None

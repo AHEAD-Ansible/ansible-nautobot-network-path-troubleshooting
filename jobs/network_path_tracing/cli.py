@@ -16,7 +16,6 @@ from .steps import GatewayDiscoveryStep, InputValidationStep
 
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
-
     parser = argparse.ArgumentParser(description="Run network path tracing steps from the CLI")
     parser.add_argument(
         "--data-source",
@@ -34,7 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def select_data_source(settings: NetworkPathSettings, source: str):
     """Return the configured Nautobot data source implementation."""
-
     if source == "api":
         api_settings = settings.api_settings()
         if not api_settings:
@@ -42,10 +40,8 @@ def select_data_source(settings: NetworkPathSettings, source: str):
                 "Nautobot API is not configured. Set NAUTOBOT_API_URL and NAUTOBOT_API_TOKEN."
             )
         return NautobotAPIDataSource(api_settings)
-
     if source == "orm":
         return NautobotORMDataSource()
-
     raise RuntimeError(f"Unsupported data source '{source}'")
 
 
@@ -54,8 +50,7 @@ def run_steps(
     data_source: str = "api",
     debug: bool = False,
 ) -> dict[str, Any]:
-    """Execute steps 1 and 2 and return a JSON-serialisable payload."""
-
+    """Execute steps 1 and 2 and return a JSON-serializable payload."""
     settings = settings or NetworkPathSettings()
     source = select_data_source(settings, data_source)
 
@@ -97,7 +92,6 @@ def run_steps(
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for invoking individual workflow steps."""
-
     parser = build_parser()
     args = parser.parse_args(argv)
     settings = NetworkPathSettings()

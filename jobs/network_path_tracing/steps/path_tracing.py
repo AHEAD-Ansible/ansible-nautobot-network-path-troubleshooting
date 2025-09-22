@@ -47,9 +47,9 @@ class PathTracingStep:
         self._max_failed_hops = 3
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> PathTracingResult:
+        """Execute the path tracing workflow."""
         if not gateway.found or not gateway.gateway:
             raise PathTracingError("No gateway available to start path tracing")
-
         paths = []
         issues = []
         seen_devices: Set[str] = set()
@@ -76,27 +76,24 @@ class PathTracingStep:
         issues: List[str],
         seen_devices: Set[str]
     ):
+        """Recursively trace the path to the destination."""
         if not current_device:
             issues.append("No device found for hop; path terminated.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-
         if len(current_hops) >= self._max_hops:
             issues.append(f"Maximum hop count ({self._max_hops}) exceeded.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-
         if current_device in seen_devices:
             issues.append(f"Routing loop detected at device '{current_device}'.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
         seen_devices.add(current_device)
-
         if failed_hops >= self._max_failed_hops:
             issues.append(f"Too many failed hops ({failed_hops}); potential routing issue.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-
         next_hop_step = NextHopDiscoveryStep(self._data_source, self._settings)
         try:
             next_hop_result = next_hop_step.run(
@@ -120,7 +117,6 @@ class PathTracingStep:
             issues.append(f"Next-hop lookup failed: {exc}")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-
         if not next_hop_result.found:
             current_hops.append(PathHop(
                 device_name=current_device,
@@ -132,12 +128,10 @@ class PathTracingStep:
             issues.append("Routing blackhole detected: no next hop found.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-
         for next_hop in next_hop_result.next_hops:
             next_hop_ip = next_hop["next_hop_ip"]
             egress_if = next_hop["egress_interface"]
             next_hop_record = self._data_source.get_ip_address(next_hop_ip) if next_hop_ip else None
-
             current_hops.append(PathHop(
                 device_name=current_device,
                 interface_name=current_interface,
@@ -145,11 +139,9 @@ class PathTracingStep:
                 egress_interface=egress_if,
                 details=next_hop_result.details
             ))
-
             if next_hop_ip == destination_ip or (next_hop_record and next_hop_record.prefix_length == 32):
                 paths.append(Path(hops=current_hops[:], reached_destination=True, issues=issues[:]))
                 continue
-
             next_device = next_hop_record.device_name if next_hop_record else None
             next_interface = next_hop_record.interface_name if next_hop_record else egress_if
             self._trace_path(

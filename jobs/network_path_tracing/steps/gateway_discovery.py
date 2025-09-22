@@ -14,7 +14,6 @@ from .input_validation import InputValidationResult
 @dataclass(frozen=True)
 class GatewayDiscoveryResult:
     """Outcome of the gateway discovery workflow."""
-
     found: bool
     method: str
     gateway: Optional[IPAddressRecord]
@@ -23,14 +22,12 @@ class GatewayDiscoveryResult:
 
 class GatewayDiscoveryStep:
     """Locate the default gateway for the validated source prefix."""
-
     def __init__(self, data_source: NautobotDataSource, custom_field: str) -> None:
         self._data_source = data_source
         self._custom_field = custom_field
 
     def run(self, validation: InputValidationResult) -> GatewayDiscoveryResult:
         """Locate the gateway IP, falling back to the lowest usable host."""
-
         if validation.is_host_ip:
             return GatewayDiscoveryResult(
                 found=True,
@@ -66,14 +63,12 @@ class GatewayDiscoveryStep:
     def _fallback_to_lowest_host(
         self, validation: InputValidationResult
     ) -> Optional[IPAddressRecord]:
+        """Fall back to the lowest usable host IP in the prefix."""
         network = ipaddress.ip_network(validation.source_prefix.prefix)
-
         if network.version == 4 and network.prefixlen >= 30:
             return None
-
         try:
             first_host = next(network.hosts())
         except StopIteration:
             return None
-
         return self._data_source.get_ip_address(str(first_host))

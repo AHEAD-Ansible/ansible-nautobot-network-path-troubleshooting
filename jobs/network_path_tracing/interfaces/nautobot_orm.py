@@ -18,6 +18,7 @@ except Exception:
 class NautobotORMDataSource(NautobotDataSource):
     """Retrieve data directly from Nautobot's Django models."""
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
+        """Return the IPAddress record for the given address."""
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
         ip_obj = (
@@ -31,6 +32,7 @@ class NautobotORMDataSource(NautobotDataSource):
         return self._build_ip_record(ip_obj, override_address=address)
 
     def get_most_specific_prefix(self, address: str) -> Optional[PrefixRecord]:
+        """Return the most specific prefix containing the supplied address."""
         if Prefix is None:
             raise RuntimeError("Nautobot is not available in this environment")
         prefix_obj = (
@@ -48,6 +50,7 @@ class NautobotORMDataSource(NautobotDataSource):
         )
 
     def find_gateway_ip(self, prefix: PrefixRecord, custom_field: str) -> Optional[IPAddressRecord]:
+        """Return the gateway IP within the prefix tagged via custom_field."""
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
         prefix_obj = Prefix.objects.filter(prefix=prefix.prefix).first() if Prefix else None
@@ -65,6 +68,7 @@ class NautobotORMDataSource(NautobotDataSource):
         return self._build_ip_record(ip_obj)
 
     def get_device(self, name: str) -> Optional[DeviceRecord]:
+        """Return the Device record for the given name."""
         if Device is None:
             raise RuntimeError("Nautobot is not available in this environment")
         device_obj = (
@@ -90,6 +94,7 @@ class NautobotORMDataSource(NautobotDataSource):
         )
 
     def _build_ip_record(self, ip_obj: Any, override_address: Optional[str] = None) -> IPAddressRecord:
+        """Build an IPAddressRecord from ORM data."""
         address_value = override_address or str(ip_obj.address)
         address = address_value.split("/")[0]
         prefix_length = int(address_value.split("/")[1]) if "/" in address_value else int(str(ip_obj.address).split("/")[1])

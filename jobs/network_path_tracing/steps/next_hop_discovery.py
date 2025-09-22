@@ -33,40 +33,34 @@ class NextHopDiscoveryStep:
         self._settings = settings
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> NextHopDiscoveryResult:
+        """Execute the next-hop discovery for the destination IP."""
         if not gateway.found or not gateway.gateway or not gateway.gateway.device_name:
             raise NextHopDiscoveryError("No gateway device available for next-hop lookup")
-
         device = self._data_source.get_device(gateway.gateway.device_name)
         if not device:
             raise NextHopDiscoveryError(f"Device '{gateway.gateway.device_name}' not found in Nautobot")
-
         if not device.primary_ip:
             raise NextHopDiscoveryError(f"No primary/management IP found for device '{device.name}'")
-
         ingress_if = gateway.gateway.interface_name
         if not ingress_if:
             raise NextHopDiscoveryError("No ingress interface known for gateway")
-
         if device.platform_slug == "panos":
             return self._run_palo_alto_lookup(device, ingress_if, validation.destination_ip)
-        else:
-            return self._run_napalm_lookup(device, ingress_if, validation.destination_ip)
+        return self._run_napalm_lookup(device, ingress_if, validation.destination_ip)
 
     def _run_palo_alto_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
+        """Perform next-hop lookup for Palo Alto devices."""
         pa_settings = self._settings.pa_settings()
         if not pa_settings:
             raise NextHopDiscoveryError("Palo Alto credentials not configured (set PA_USERNAME and PA_PASSWORD)")
-
         client = PaloAltoClient(host=device.primary_ip, verify_ssl=pa_settings.verify_ssl, timeout=10)
         try:
             api_key = client.keygen(pa_settings.username, pa_settings.password)
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Authentication failed for '{device.primary_ip}': {exc}") from exc
-
         vr = client.get_virtual_router_for_interface(api_key, ingress_if)
         if not vr:
             raise NextHopDiscoveryError(f"No virtual-router found for interface '{ingress_if}' on '{device.name}'")
-
         try:
             res = client.fib_lookup(api_key, vr, destination_ip)
             if not (res["next_hop"] or res["egress_interface"]):
@@ -80,13 +74,12 @@ class NextHopDiscoveryStep:
             raise NextHopDiscoveryError(f"Next-hop lookup failed for '{destination_ip}': {exc}") from exc
 
     def _run_napalm_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
+        """Perform next-hop lookup using NAPALM."""
         if napalm is None:
             raise NextHopDiscoveryError("NAPALM is not installed; cannot perform lookup for non-Palo Alto device")
-
         napalm_settings = self._settings.napalm_settings()
         if not napalm_settings:
             raise NextHopDiscoveryError("NAPALM credentials not configured (set NAPALM_USERNAME and NAPALM_PASSWORD)")
-
         driver_map = {
             "ios": "ios",
             "nxos": "nxos",

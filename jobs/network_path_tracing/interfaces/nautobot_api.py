@@ -24,12 +24,14 @@ class NautobotAPISession:
         self._session.headers.update({"Authorization": f"Token {self.settings.token}"})
 
     def get(self, path: str, **kwargs) -> requests.Response:
+        """Fetch data from the Nautobot API."""
         url = urljoin(self.settings.base_url.rstrip("/") + "/", path.lstrip("/"))
         response = self._session.get(url, verify=self.settings.verify_ssl, timeout=30, **kwargs)
         response.raise_for_status()
         return response
 
     def get_json(self, path: str, **kwargs) -> Dict[str, Any]:
+        """Fetch JSON data from the Nautobot API."""
         return self.get(path, **kwargs).json()
 
 
@@ -39,6 +41,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         self._session = NautobotAPISession(settings)
 
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
+        """Return the IPAddress record for the given address."""
         params = {"address": address, "limit": 1}
         response = self._session.get("/api/ipam/ip-addresses/", params=params)
         payload = response.json()
@@ -49,6 +52,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return self._build_ip_record(record, override_address=address)
 
     def get_most_specific_prefix(self, address: str) -> Optional[PrefixRecord]:
+        """Return the most specific prefix containing the supplied address."""
         params = {"contains": address, "limit": 50}
         response = self._session.get("/api/ipam/prefixes/", params=params)
         payload = response.json()
@@ -68,6 +72,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         )
 
     def find_gateway_ip(self, prefix: PrefixRecord, custom_field: str) -> Optional[IPAddressRecord]:
+        """Return the gateway IP within the prefix tagged via custom_field."""
         parent_value = self._ensure_prefix_id(prefix)
         params = {"parent": parent_value, f"cf_{custom_field}": True, "limit": 10}
         payload = self._session.get_json("/api/ipam/ip-addresses/", params=params)
@@ -78,6 +83,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return self._build_ip_record(record)
 
     def get_device(self, name: str) -> Optional[DeviceRecord]:
+        """Return the Device record for the given name."""
         params = {"name": name, "limit": 1, "depth": 1}
         payload = self._session.get_json("/api/dcim/devices/", params=params)
         results = payload.get("results", [])
@@ -102,6 +108,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         )
 
     def _ensure_prefix_id(self, prefix: PrefixRecord) -> str:
+        """Resolve the prefix ID or fall back to prefix string."""
         if prefix.id:
             return prefix.id
         params = {"prefix": prefix.prefix, "limit": 1}
@@ -115,6 +122,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return prefix.prefix
 
     def _expand_ip_record(self, record: dict) -> dict:
+        """Expand IP record with detailed data if needed."""
         if isinstance(record.get("assigned_object"), dict) and record.get("assigned_object"):
             return record
         record_id = record.get("id")
@@ -127,6 +135,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return expanded if isinstance(expanded, dict) else record
 
     def _build_ip_record(self, record: dict, override_address: Optional[str] = None) -> IPAddressRecord:
+        """Build an IPAddressRecord from API data."""
         address_value = override_address or record.get("host") or record.get("address", "")
         prefix_length = (
             record.get("mask_length")
@@ -148,6 +157,7 @@ class NautobotAPIDataSource(NautobotDataSource):
 
     @staticmethod
     def _extract_prefix_length(value: Optional[str]) -> Optional[int]:
+        """Extract prefix length from an address string."""
         if isinstance(value, str) and "/" in value:
             try:
                 return int(value.split("/")[1])
@@ -157,11 +167,13 @@ class NautobotAPIDataSource(NautobotDataSource):
 
     @staticmethod
     def _strip_prefix(value: Optional[str]) -> str:
+        """Strip prefix length from an address string."""
         if not isinstance(value, str):
             return ""
         return value.split("/")[0]
 
     def _resolve_assignment_details(self, record: dict) -> tuple[Optional[str], Optional[str]]:
+        """Resolve device and interface names from IP record."""
         device_name: Optional[str] = None
         interface_name: Optional[str] = None
         assigned = record.get("assigned_object")
@@ -189,6 +201,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return device_name, interface_name
 
     def _fetch_device_name_via_api(self, record: dict) -> Optional[str]:
+        """Fetch device name via API for an assigned object."""
         assigned_type = record.get("assigned_object_type")
         assigned_id = record.get("assigned_object_id")
         if not assigned_type or not assigned_id:
@@ -213,6 +226,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return related.get("name") or related.get("display")
 
     def _endpoint_for_assigned_object(self, assigned_type: str) -> Optional[str]:
+        """Map assigned object type to API endpoint."""
         mapping = {
             "dcim.interface": "/api/dcim/interfaces/",
             "virtualization.vminterface": "/api/virtualization/interfaces/",
@@ -222,6 +236,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return mapping.get(assigned_type)
 
     def _resolve_names_from_interfaces(self, interfaces: list[dict]) -> tuple[Optional[str], Optional[str]]:
+        """Resolve device and interface names from interface list."""
         for iface in interfaces:
             url = iface.get("url")
             if not isinstance(url, str) or not url:
@@ -232,49 +247,16 @@ class NautobotAPIDataSource(NautobotDataSource):
         return None, None
 
     def _resolve_names_from_url(self, url: str) -> tuple[Optional[str], Optional[str]]:
+        """Resolve device and interface names from a URL."""
         try:
             payload = self._session.get_json(url, params={"depth": 1})
         except requests.RequestException:
             return None, None
         return self._extract_names_from_payload(payload)
 
-    def _lookup_device_by_primary_ip(self, record: dict) -> Optional[str]:
-        address = record.get("address")
-        if not isinstance(address, str):
-            return None
-        ip, _, _ = address.partition("/")
-        if not ip:
-            return None
-        search_patterns = [
-            ("/api/dcim/devices/", {"primary_ip4_id": record.get("id")}),
-            ("/api/dcim/devices/", {"primary_ip6_id": record.get("id")}),
-            ("/api/dcim/devices/", {"primary_ip4": ip}),
-            ("/api/dcim/devices/", {"primary_ip6": ip}),
-            ("/api/dcim/devices/", {"primary_ip": ip}),
-            ("/api/virtualization/virtual-machines/", {"primary_ip4_id": record.get("id")}),
-            ("/api/virtualization/virtual-machines/", {"primary_ip6_id": record.get("id")}),
-            ("/api/virtualization/virtual-machines/", {"primary_ip4": ip}),
-            ("/api/virtualization/virtual-machines/", {"primary_ip6": ip}),
-            ("/api/virtualization/virtual-machines/", {"primary_ip": ip}),
-        ]
-        for endpoint, params in search_patterns:
-            query = {k: v for k, v in params.items() if v}
-            if not query:
-                continue
-            try:
-                payload = self._session.get_json(endpoint, params={**query, "limit": 1})
-            except requests.RequestException:
-                continue
-            results = payload.get("results", [])
-            if results:
-                result = results[0]
-                name = result.get("name") or result.get("display")
-                if name:
-                    return name
-        return None
-
     @staticmethod
     def _extract_name_from_relationship(related: Any) -> Optional[str]:
+        """Extract name from a relationship object."""
         if isinstance(related, dict):
             return related.get("name") or related.get("display")
         if isinstance(related, str):
@@ -282,6 +264,7 @@ class NautobotAPIDataSource(NautobotDataSource):
         return None
 
     def _extract_names_from_payload(self, payload: dict) -> tuple[Optional[str], Optional[str]]:
+        """Extract device and interface names from API payload."""
         interface_name = payload.get("name") or payload.get("display")
         device_name = self._extract_name_from_relationship(payload.get("device"))
         if not device_name:
