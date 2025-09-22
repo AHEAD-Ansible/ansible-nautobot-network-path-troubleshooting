@@ -50,8 +50,8 @@ class NetworkPathTracerJob(Job):
         """Execute the full network path tracing workflow.
 
         Args:
-            source_ip (str): Source IP address for path tracing.
-            destination_ip (str): Destination IP address for path tracing.
+            source_ip (str): Source IP address for path tracing (e.g., '10.0.0.1/24').
+            destination_ip (str): Destination IP address for path tracing (e.g., '4.2.2.1/24').
             **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
 
         Returns:
@@ -81,8 +81,8 @@ class NetworkPathTracerJob(Job):
 
         # Validate IP addresses
         try:
-            ipaddress.ip_address(source_ip)
-            ipaddress.ip_address(destination_ip)
+            ipaddress.ip_address(self._to_address_string(source_ip))
+            ipaddress.ip_address(self._to_address_string(destination_ip))
         except ValueError as exc:
             self._fail_job(f"Invalid IP address: {exc}", grouping="input-validation")
             raise ValueError(f"Invalid IP address: {exc}")
@@ -233,12 +233,11 @@ class NetworkPathTracerJob(Job):
         """Normalize Nautobot job input to a plain string IP address.
 
         Args:
-            value: Input value (string or object with 'address' attribute).
+            value: Input value (string, e.g., '10.0.0.1/24').
 
         Returns:
-            str: Normalized IP address without prefix.
+            str: Normalized IP address without prefix (e.g., '10.0.0.1').
         """
-        address = getattr(value, "address", value)
-        if isinstance(address, str):
-            return address.split("/")[0]
-        return str(address).split("/")[0]
+        if isinstance(value, str):
+            return value.split("/")[0]
+        return str(value).split("/")[0]
