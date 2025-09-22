@@ -19,22 +19,16 @@ class NautobotORMDataSource(NautobotDataSource):
     """Retrieve data directly from Nautobot's Django models."""
 
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
-        """Return the IPAddress record for the given address.
-
-        Args:
-            address (str): IP address without prefix (e.g., '10.0.0.1').
-
-        Returns:
-            Optional[IPAddressRecord]: The IP address record, or None if not found.
-        """
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
+        print(f"Querying IPAddress for host={address}")  # Temporary debug
         ip_obj = (
             IPAddress.objects.filter(host=address)
             .select_related("device", "assigned_object")
             .prefetch_related("assigned_object__device", "assigned_object__virtual_machine")
             .first()
         )
+        print(f"Found IPAddress: {ip_obj}")  # Temporary debug
         if ip_obj is None:
             return None
         return self._build_ip_record(ip_obj, override_address=address)
