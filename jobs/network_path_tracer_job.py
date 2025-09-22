@@ -1,0 +1,155 @@
+"""Nautobot Job that orchestrates the network path tracing workflow."""
+
+from __future__ import annotations
+
+from nautobot.core.jobs import IPAddressVar, Job
+from nautobot.extras.models import CustomField, CustomObject
+from django.core.exceptions import ObjectDoesNotExist
+
+from .network_path_tracing import (
+    GatewayDiscoveryError,
+    GatewayDiscoveryStep,
+    InputValidationError,
+    InputValidationStep,
+    NetworkPathSettings,
+    NautobotORMDataSource,
+    NextHopDiscoveryError,
+    NextHopDiscoveryStep,
+    PathTracingError,
+    PathTracingStep,
+)
+
+
+class NetworkPathTracerJob(Job):
+    """Trace the network path between source and destination IPs."""
+
+    class Meta:
+        name = "Network Path Tracer"
+        description = (
+            "Trace the full network path from source to destination IP, "
+            "including gateway discovery, next-hop lookups, and ECMP handling."
+        )
+        read_only = False
+
+    source_ip = IPAddressVar(
+        description="Source IP Address (e.g., server IP)",
+        required=True,
+    )
+    destination_ip = IPAddressVar(
+        description="Destination IP Address",
+        required=True,
+    )
+
+    def run(self, data, commit):  # noqa: D401 - Nautobot Job signature
+        """Execute the full network path tracing workflow."""
+
+        settings = NetworkPathSettings(
+            source_ip=self._to_address_string(data["source_ip"]),
+            destination_ip=self._to_address_string(data["destination_ip"]),
+        )
+
+        data_source = NautobotORMDataSource()
+        validation_step = InputValidationStep(data_source)
+        gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
+        next_hop_step = NextHopDiscoveryStep(data_source, settings)
+        path_tracing_step = PathTracingStep(data_source, settings)
+
+        try:
+            # Step 1: Validate inputs
+            validation = validation_step.run(settings)
+            self.log_info("Input validation completed.")
+
+            # Step 2: Locate gateway
+            gateway = gateway_step.run(validation)
+            self.log_info(f"Gateway discovery: {gateway.details}")
+
+            # Step 3: Initialize path tracing
+            path_result = path_tracing_step.run(validation, gateway)
+            self.log_info("Path tracing completed.")
+
+            # Prepare result payload
+            result_payload = {
+                "status": "ok",
+                "source": {
+                    "address": validation.source_ip,
+                    "prefix_length": validation.source_record.prefix_length,
+                    "prefix": validation.source_prefix.prefix,
+                    "device_name": validation.source_record.device_name,
+                    "interface_name": validation.source_record.interface_name,
+                    "is_host_ip": validation.is_host_ip,
+                },
+                "gateway": {
+                    "found": gateway.found,
+                    "method": gateway.method,
+                    "address": gateway.gateway.address if gateway.gateway else None,
+                    "device_name": gateway.gateway.device_name if gateway.gateway else None,
+                    "interface_name": gateway.gateway.interface_name if gateway.gateway else None,
+                    "details": gateway.details,
+                },
+                "paths": [
+                    {
+                        "hops": [
+                            {
+                                "device_name": hop.device_name,
+                                "interface_name": hop.interface_name,
+                                "next_hop_ip": hop.next_hop_ip,
+                                "egress_interface": hop.egress_interface,
+                                "details": hop.details,
+                            }
+                            for hop in path.hops
+                        ],
+                        "reached_destination": path.reached_destination,
+                        "issues": path.issues,
+                    }
+                    for path in path_result.paths
+                ],
+                "issues": path_result.issues,
+            }
+
+            # Store result as a custom object in Nautobot
+            self._store_path_result(result_payload)
+
+            self.job_result.data = result_payload
+            self.job_result.save()
+            self.log_success("Network path trace completed successfully.")
+
+        except InputValidationError as exc:
+            self.log_failure(f"Input validation failed: {exc}")
+            raise
+        except GatewayDiscoveryError as exc:
+            self.log_failure(f"Gateway discovery failed: {exc}")
+            raise
+        except NextHopDiscoveryError as exc:
+            self.log_failure(f"Next-hop discovery failed: {exc}")
+            raise
+        except PathTracingError as exc:
+            self.log_failure(f"Path tracing failed: {exc}")
+            raise
+        except Exception as exc:
+            self.log_failure(f"Unexpected error: {exc}")
+            raise
+
+    def _store_path_result(self, payload: dict):
+        """Store the path tracing result as a custom object in Nautobot."""
+        try:
+            custom_field = CustomField.objects.get(name="network_path_trace_results")
+        except ObjectDoesNotExist:
+            self.log_warning("Custom field 'network_path_trace_results' not found; skipping storage.")
+            return
+
+        custom_object = CustomObject(
+            custom_field=custom_field,
+            value=payload,
+            object_type_id="extras.jobresult",
+            object_id=self.job_result.id,
+        )
+        custom_object.save()
+        self.log_info("Path tracing result stored as custom object.")
+
+    @staticmethod
+    def _to_address_string(value) -> str:
+        """Normalize Nautobot job input to a plain string IP address."""
+        address = getattr(value, "address", value)
+        if isinstance(address, str):
+            return address.split("/")[0]
+        return str(address).split("/")[0]

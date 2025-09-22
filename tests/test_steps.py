@@ -1,11 +1,10 @@
 import pytest
 
-from network_path_tracing.config import NetworkPathSettings
-from network_path_tracing.exceptions import GatewayDiscoveryError, InputValidationError
-from network_path_tracing.interfaces.nautobot import IPAddressRecord, PrefixRecord
-from network_path_tracing.steps import (
+from jobs.network_path_tracing import NetworkPathSettings
+from jobs.network_path_tracing import GatewayDiscoveryError, InputValidationError
+from jobs.network_path_tracing.interfaces.nautobot import IPAddressRecord, PrefixRecord
+from jobs.network_path_tracing.steps import (
     GatewayDiscoveryStep,
-    GatewayDiscoveryResult,
     InputValidationResult,
     InputValidationStep,
 )
