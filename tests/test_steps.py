@@ -1,5 +1,9 @@
-import pytest
+"""Unit tests for network path tracing steps and job."""
 
+import pytest
+from unittest.mock import MagicMock
+
+from nautobot.extras.choices import LogLevelChoices
 from jobs.network_path_tracing import NetworkPathSettings
 from jobs.network_path_tracing import GatewayDiscoveryError, InputValidationError
 from jobs.network_path_tracing.interfaces.nautobot import IPAddressRecord, PrefixRecord
@@ -8,6 +12,7 @@ from jobs.network_path_tracing.steps import (
     InputValidationResult,
     InputValidationStep,
 )
+from jobs.network_path_tracer_job import NetworkPathTracerJob
 
 
 class FakeDataSource:
@@ -98,17 +103,51 @@ def test_input_validation_missing_prefix(default_settings, source_ip_record):
     assert "No containing prefix" in str(excinfo.value)
 
 
-def build_validation_result(
-    prefix: PrefixRecord,
-    record: IPAddressRecord,
-    is_host: bool,
-) -> InputValidationResult:
-    return InputValidationResult(
-        source_ip=record.address,
-        destination_ip="10.20.20.20",
-        source_record=record,
-        source_prefix=prefix,
-        is_host_ip=is_host,
+def test_network_path_tracer_job_run():
+    """Test job run with valid inputs."""
+    job = NetworkPathTracerJob()
+    job.logger = MagicMock()
+    job.job_result = MagicMock()
+    with pytest.raises(InputValidationError, match="Source IP 10.0.0.1 not found"):
+        job.run(source_ip="10.0.0.1", destination_ip="4.2.2.1")
+    job.logger.info.assert_any_call(
+        "Starting network path tracing job for source_ip=10.0.0.1, destination_ip=4.2.2.1",
+        extra={"grouping": "job-start", "object": job.job_result}
+    )
+    job.job_result.log.assert_any_call("Job has started.", level_choice=LogLevelChoices.LOG_INFO)
+
+
+def test_network_path_tracer_job_invalid_ip():
+    """Test job run with invalid IP address."""
+    job = NetworkPathTracerJob()
+    job.logger = MagicMock()
+    job.job_result = MagicMock()
+    with pytest.raises(ValueError, match="Invalid IP address"):
+        job.run(source_ip="invalid-ip", destination_ip="4.2.2.1")
+    job.logger.failure.assert_called_with(
+        "Invalid IP address: Invalid address format for invalid-ip",
+        extra={"grouping": "input-validation"}
+    )
+    job.job_result.log.assert_called_with(
+        "Invalid IP address: Invalid address format for invalid-ip",
+        level_choice=LogLevelChoices.LOG_FAILURE
+    )
+
+
+def test_network_path_tracer_job_missing_inputs():
+    """Test job run with missing inputs."""
+    job = NetworkPathTracerJob()
+    job.logger = MagicMock()
+    job.job_result = MagicMock()
+    with pytest.raises(ValueError, match="Missing source_ip or destination_ip"):
+        job.run(source_ip="10.0.0.1")
+    job.logger.failure.assert_called_with(
+        "Missing source_ip or destination_ip in job data or kwargs",
+        extra={"grouping": "input-validation"}
+    )
+    job.job_result.log.assert_called_with(
+        "Missing source_ip or destination_ip in job data or kwargs",
+        level_choice=LogLevelChoices.LOG_FAILURE
     )
 
 
@@ -146,14 +185,12 @@ def test_gateway_custom_field(prefix_record, source_ip_record):
 
 
 def test_gateway_fallback_to_lowest_host(prefix_record, source_ip_record):
-    # Prepare fallback IP record for the lowest usable host .1
     fallback_gateway = IPAddressRecord(
         address="10.10.10.1",
         prefix_length=24,
         device_name="gw-fallback",
         interface_name="Gig0/1",
     )
-
     data_source = FakeDataSource(
         ip_records={fallback_gateway.address: fallback_gateway},
         prefix_record=prefix_record,
@@ -167,12 +204,10 @@ def test_gateway_fallback_to_lowest_host(prefix_record, source_ip_record):
 
     assert result.method == "lowest_host"
     assert result.gateway == fallback_gateway
-    # Ensure fallback queried the data source for the first usable host.
     assert data_source.get_ip_address("10.10.10.1") == fallback_gateway
 
 
 def test_gateway_missing_data_raises(prefix_record, source_ip_record):
-    # /30 network should prevent lowest-host fallback and force an error.
     small_prefix = PrefixRecord(prefix="10.10.10.0/30", status="active", id="pfx-small")
     validation = build_validation_result(small_prefix, source_ip_record, is_host=False)
 
@@ -184,10 +219,23 @@ def test_gateway_missing_data_raises(prefix_record, source_ip_record):
 
 
 def test_gateway_lowest_host_requires_existing_ip(prefix_record, source_ip_record):
-    # Network with available hosts but missing in Nautobot should raise.
     validation = build_validation_result(prefix_record, source_ip_record, is_host=False)
     data_source = FakeDataSource(ip_records={}, prefix_record=prefix_record, gateway_record=None)
     step = GatewayDiscoveryStep(data_source, "network_gateway")
 
     with pytest.raises(GatewayDiscoveryError):
         step.run(validation)
+
+
+def build_validation_result(
+    prefix: PrefixRecord,
+    record: IPAddressRecord,
+    is_host: bool,
+) -> InputValidationResult:
+    return InputValidationResult(
+        source_ip=record.address,
+        destination_ip="10.20.20.20",
+        source_record=record,
+        source_prefix=prefix,
+        is_host_ip=is_host,
+    )
