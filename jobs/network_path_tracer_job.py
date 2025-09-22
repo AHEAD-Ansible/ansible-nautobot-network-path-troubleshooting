@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from nautobot.core.jobs import IPAddressVar, Job
-from nautobot.extras.models import CustomField, CustomObject
-from django.core.exceptions import ObjectDoesNotExist
+from nautobot.extras.models import CustomField  # Removed CustomObject
 
 from .network_path_tracing import (
     GatewayDiscoveryError,
@@ -106,7 +105,7 @@ class NetworkPathTracerJob(Job):
                 "issues": path_result.issues,
             }
 
-            # Store result as a custom object in Nautobot
+            # Store result in JobResult custom field data
             self._store_path_result(result_payload)
 
             self.job_result.data = result_payload
@@ -130,21 +129,15 @@ class NetworkPathTracerJob(Job):
             raise
 
     def _store_path_result(self, payload: dict):
-        """Store the path tracing result as a custom object in Nautobot."""
+        """Store the path tracing result in JobResult's custom_field_data."""
         try:
-            custom_field = CustomField.objects.get(name="network_path_trace_results")
-        except ObjectDoesNotExist:
+            CustomField.objects.get(name="network_path_trace_results")
+        except CustomField.DoesNotExist:
             self.log_warning("Custom field 'network_path_trace_results' not found; skipping storage.")
             return
 
-        custom_object = CustomObject(
-            custom_field=custom_field,
-            value=payload,
-            object_type_id="extras.jobresult",
-            object_id=self.job_result.id,
-        )
-        custom_object.save()
-        self.log_info("Path tracing result stored as custom object.")
+        self.job_result.custom_field_data["network_path_trace_results"] = payload
+        self.job_result.save()
 
     @staticmethod
     def _to_address_string(value) -> str:
