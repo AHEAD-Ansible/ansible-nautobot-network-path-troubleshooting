@@ -43,17 +43,27 @@ class NetworkPathTracerJob(Job):
         required=True,
     )
 
-    def run(self, data, commit):  # noqa: D401 - Nautobot Job signature
-        """Execute the full network path tracing workflow."""
+    def run(self, data, commit, **kwargs):  # noqa: D401 - Nautobot Job signature
+        """Execute the full network path tracing workflow.
+
+        Args:
+            data (dict): Dictionary containing job input data (e.g., {'source_ip': '10.0.0.1', 'destination_ip': '4.2.2.1'}).
+            commit (bool): Whether to commit changes to the database.
+            **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
+        """
+        # Log any unexpected kwargs for debugging
+        if kwargs:
+            self.log_warning(f"Unexpected keyword arguments received: {kwargs}")
+
         # Log the start of the job with input IPs for debugging
         self.log_info(
             f"Starting network path tracing job with source_ip={data.get('source_ip', 'None')}, "
             f"destination_ip={data.get('destination_ip', 'None')}"
         )
 
-        # Validate that input IPs are provided
+        # Validate that input IPs are provided in the data dictionary
         if not data.get("source_ip") or not data.get("destination_ip"):
-            error_msg = "Missing source_ip or destination_ip"
+            error_msg = "Missing source_ip or destination_ip in job data"
             self.log_failure(error_msg)
             raise ValueError(error_msg)
 
@@ -64,7 +74,7 @@ class NetworkPathTracerJob(Job):
         except ValueError as exc:
             error_msg = f"Invalid IP address: {exc}"
             self.log_failure(error_msg)
-            raise
+            raise ValueError(error_msg)
 
         # Initialize settings with normalized IP addresses
         settings = NetworkPathSettings(
@@ -162,7 +172,11 @@ class NetworkPathTracerJob(Job):
             raise
 
     def _store_path_result(self, payload: dict):
-        """Store the path tracing result in JobResult's custom_field_data."""
+        """Store the path tracing result in JobResult's custom_field_data.
+
+        Args:
+            payload (dict): The result payload to store.
+        """
         try:
             CustomField.objects.get(name="network_path_trace_results")
         except ObjectDoesNotExist:
@@ -177,7 +191,14 @@ class NetworkPathTracerJob(Job):
 
     @staticmethod
     def _to_address_string(value) -> str:
-        """Normalize Nautobot job input to a plain string IP address."""
+        """Normalize Nautobot job input to a plain string IP address.
+
+        Args:
+            value: Input value (string or object with 'address' attribute).
+
+        Returns:
+            str: Normalized IP address without prefix.
+        """
         address = getattr(value, "address", value)
         if isinstance(address, str):
             return address.split("/")[0]
