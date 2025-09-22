@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from nautobot.core.jobs import IPAddressVar, Job
-from nautobot.extras.models import CustomField  # Removed CustomObject
+from nautobot.extras.jobs import IPAddressVar, Job
+from nautobot.extras.models import CustomField
+from django.core.exceptions import ObjectDoesNotExist
 
 from .network_path_tracing import (
     GatewayDiscoveryError,
@@ -132,7 +133,7 @@ class NetworkPathTracerJob(Job):
         """Store the path tracing result in JobResult's custom_field_data."""
         try:
             CustomField.objects.get(name="network_path_trace_results")
-        except CustomField.DoesNotExist:
+        except ObjectDoesNotExist:
             self.log_warning("Custom field 'network_path_trace_results' not found; skipping storage.")
             return
 
