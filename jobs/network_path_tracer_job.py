@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import ipaddress
+
 from nautobot.extras.jobs import IPAddressVar, Job
 from nautobot.extras.models import CustomField
 from django.core.exceptions import ObjectDoesNotExist
@@ -42,12 +45,38 @@ class NetworkPathTracerJob(Job):
 
     def run(self, data, commit):  # noqa: D401 - Nautobot Job signature
         """Execute the full network path tracing workflow."""
+        # Log the start of the job with input IPs for debugging
+        self.log_info(
+            f"Starting network path tracing job with source_ip={data.get('source_ip', 'None')}, "
+            f"destination_ip={data.get('destination_ip', 'None')}"
+        )
 
+        # Validate that input IPs are provided
+        if not data.get("source_ip") or not data.get("destination_ip"):
+            error_msg = "Missing source_ip or destination_ip"
+            self.log_failure(error_msg)
+            raise ValueError(error_msg)
+
+        # Validate that input IPs are valid IPv4/IPv6 addresses
+        try:
+            ipaddress.ip_address(data["source_ip"])
+            ipaddress.ip_address(data["destination_ip"])
+        except ValueError as exc:
+            error_msg = f"Invalid IP address: {exc}"
+            self.log_failure(error_msg)
+            raise
+
+        # Initialize settings with normalized IP addresses
         settings = NetworkPathSettings(
             source_ip=self._to_address_string(data["source_ip"]),
             destination_ip=self._to_address_string(data["destination_ip"]),
         )
+        self.log_info(
+            f"Normalized settings: source_ip={settings.source_ip}, "
+            f"destination_ip={settings.destination_ip}"
+        )
 
+        # Initialize workflow steps
         data_source = NautobotORMDataSource()
         validation_step = InputValidationStep(data_source)
         gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
@@ -56,16 +85,19 @@ class NetworkPathTracerJob(Job):
 
         try:
             # Step 1: Validate inputs
+            self.log_info("Starting input validation")
             validation = validation_step.run(settings)
-            self.log_info("Input validation completed.")
+            self.log_info("Input validation completed successfully")
 
             # Step 2: Locate gateway
+            self.log_info("Starting gateway discovery")
             gateway = gateway_step.run(validation)
-            self.log_info(f"Gateway discovery: {gateway.details}")
+            self.log_info(f"Gateway discovery completed: {gateway.details}")
 
             # Step 3: Initialize path tracing
+            self.log_info("Starting path tracing")
             path_result = path_tracing_step.run(validation, gateway)
-            self.log_info("Path tracing completed.")
+            self.log_info("Path tracing completed successfully")
 
             # Prepare result payload
             result_payload = {
@@ -111,7 +143,7 @@ class NetworkPathTracerJob(Job):
 
             self.job_result.data = result_payload
             self.job_result.save()
-            self.log_success("Network path trace completed successfully.")
+            self.log_success("Network path trace completed successfully")
 
         except InputValidationError as exc:
             self.log_failure(f"Input validation failed: {exc}")
@@ -134,7 +166,10 @@ class NetworkPathTracerJob(Job):
         try:
             CustomField.objects.get(name="network_path_trace_results")
         except ObjectDoesNotExist:
-            self.log_warning("Custom field 'network_path_trace_results' not found; skipping storage.")
+            self.log_warning(
+                "Custom field 'network_path_trace_results' not found; logging result instead"
+            )
+            self.log_info(f"Job result:\n{json.dumps(payload, indent=2)}")
             return
 
         self.job_result.custom_field_data["network_path_trace_results"] = payload

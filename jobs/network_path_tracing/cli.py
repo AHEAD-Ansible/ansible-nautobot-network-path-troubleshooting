@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any
+from typing import Any, Optional
 
-from .config import NetworkPathSettings
+from .config import NetworkPathSettings, _DEFAULT_SOURCE_IP, _DEFAULT_DESTINATION_IP
 from .exceptions import GatewayDiscoveryError, InputValidationError
 from .interfaces.nautobot_api import NautobotAPIDataSource
 from .interfaces.nautobot_orm import NautobotORMDataSource
@@ -20,13 +20,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-source",
         choices={"api", "orm"},
-        default="api",
-        help="Select where to fetch Nautobot data (defaults to api)",
+        default="orm",
+        help="Select where to fetch Nautobot data (defaults to orm)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print additional debugging information about API responses",
+        help="Print additional debugging information about API/ORM responses",
+    )
+    parser.add_argument(
+        "--source-ip",
+        default=_DEFAULT_SOURCE_IP,
+        help=f"Source IP address (default: {_DEFAULT_SOURCE_IP})",
+    )
+    parser.add_argument(
+        "--destination-ip",
+        default=_DEFAULT_DESTINATION_IP,
+        help=f"Destination IP address (default: {_DEFAULT_DESTINATION_IP})",
     )
     return parser
 
@@ -47,16 +57,37 @@ def select_data_source(settings: NetworkPathSettings, source: str):
 
 def run_steps(
     settings: NetworkPathSettings | None = None,
-    data_source: str = "api",
+    data_source: str = "orm",
     debug: bool = False,
+    source_ip: Optional[str] = None,
+    destination_ip: Optional[str] = None,
 ) -> dict[str, Any]:
     """Execute steps 1 and 2 and return a JSON-serializable payload."""
-    settings = settings or NetworkPathSettings()
+    if settings is None:
+        kwargs = {}
+        if source_ip:
+            kwargs["source_ip"] = source_ip
+        if destination_ip:
+            kwargs["destination_ip"] = destination_ip
+        settings = NetworkPathSettings(**kwargs)
+    else:
+        if source_ip or destination_ip:
+            settings = NetworkPathSettings(
+                source_ip=source_ip or settings.source_ip,
+                destination_ip=destination_ip or settings.destination_ip,
+                api=settings.api,
+                gateway_custom_field=settings.gateway_custom_field,
+                pa=settings.pa,
+                napalm=settings.napalm,
+            )
+
     source = select_data_source(settings, data_source)
 
+    print(f"Running validation for source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
     validation_step = InputValidationStep(source)
     validation = validation_step.run(settings)
 
+    print(f"Running gateway discovery for prefix={validation.source_prefix.prefix}")
     gateway_step = GatewayDiscoveryStep(source, settings.gateway_custom_field)
     gateway = gateway_step.run(validation)
 
@@ -94,13 +125,13 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point for invoking individual workflow steps."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    settings = NetworkPathSettings()
 
     try:
         payload = run_steps(
-            settings=settings,
             data_source=args.data_source,
             debug=args.debug,
+            source_ip=args.source_ip,
+            destination_ip=args.destination_ip,
         )
     except InputValidationError as exc:
         payload = {"status": "error", "error": exc.message}
