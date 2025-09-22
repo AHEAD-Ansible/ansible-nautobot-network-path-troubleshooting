@@ -50,21 +50,21 @@ class NetworkPathTracerJob(Job):
         """Execute the full network path tracing workflow.
 
         Args:
-            source_ip (str): Source IP address for path tracing (e.g., '10.0.0.1/24').
-            destination_ip (str): Destination IP address for path tracing (e.g., '4.2.2.1/24').
+            source_ip (str): Source IP address (e.g., '10.0.0.1/24').
+            destination_ip (str): Destination IP address (e.g., '4.2.2.1/24').
             **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
 
         Returns:
             dict: Result payload containing path tracing details.
 
         Raises:
-            ValueError: If source_ip or destination_ip is missing or invalid.
+            ValueError: If source_ip or destination_ip is invalid.
             InputValidationError: If IP addresses fail Nautobot data validation.
             GatewayDiscoveryError: If gateway discovery fails.
             NextHopDiscoveryError: If next-hop discovery fails.
             PathTracingError: If path tracing fails.
         """
-        # Log job start with structured metadata
+        # Log job start
         self.logger.info(
             f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}",
             extra={"grouping": "job-start", "object": self.job_result}
@@ -72,7 +72,7 @@ class NetworkPathTracerJob(Job):
         self.job_result.log("Job has started.", level_choice=LogLevelChoices.LOG_INFO)
         self.job_result.save()
 
-        # Log any unexpected kwargs for debugging
+        # Log unexpected kwargs
         if kwargs:
             self.logger.warning(
                 f"Unexpected keyword arguments received: {kwargs}",
@@ -87,7 +87,7 @@ class NetworkPathTracerJob(Job):
             self._fail_job(f"Invalid IP address: {exc}", grouping="input-validation")
             raise ValueError(f"Invalid IP address: {exc}")
 
-        # Initialize settings with normalized IP addresses
+        # Initialize settings
         settings = NetworkPathSettings(
             source_ip=self._to_address_string(source_ip),
             destination_ip=self._to_address_string(destination_ip),
@@ -162,7 +162,7 @@ class NetworkPathTracerJob(Job):
                 "issues": path_result.issues,
             }
 
-            # Store result in JobResult custom field data
+            # Store result
             self._store_path_result(result_payload)
 
             # Save result and mark success
