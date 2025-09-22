@@ -1,4 +1,6 @@
 """Network Path Tracing Job package."""
+
+from .network_path_tracer_job import NetworkPathTracerJob
 from nautobot.apps.jobs import register_jobs
 
 register_jobs(NetworkPathTracerJob)
