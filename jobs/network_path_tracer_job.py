@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import ipaddress
+from typing import Any, Optional
 
-from nautobot.extras.jobs import IPAddressVar, Job
+from nautobot.core.jobs import IPAddressVar, Job
 from nautobot.extras.models import CustomField
 from django.core.exceptions import ObjectDoesNotExist
 
@@ -32,7 +33,7 @@ class NetworkPathTracerJob(Job):
             "Trace the full network path from source to destination IP, "
             "including gateway discovery, next-hop lookups, and ECMP handling."
         )
-        read_only = False
+        has_sensitive_variables = False
 
     source_ip = IPAddressVar(
         description="Source IP Address (e.g., server IP)",
@@ -43,34 +44,38 @@ class NetworkPathTracerJob(Job):
         required=True,
     )
 
-    def run(self, data, commit, **kwargs):  # noqa: D401 - Nautobot Job signature
+    def run(self, data: Optional[dict] = None, commit: Optional[bool] = None, *, source_ip: str = None, destination_ip: str = None, **kwargs) -> None:
         """Execute the full network path tracing workflow.
 
         Args:
-            data (dict): Dictionary containing job input data (e.g., {'source_ip': '10.0.0.1', 'destination_ip': '4.2.2.1'}).
-            commit (bool): Whether to commit changes to the database.
+            data (Optional[dict]): Dictionary containing job input data (e.g., {'source_ip': '10.0.0.1', 'destination_ip': '4.2.2.1'}).
+            commit (Optional[bool]): Whether to commit changes to the database.
+            source_ip (str, optional): Source IP address (used if data is not provided).
+            destination_ip (str, optional): Destination IP address (used if data is not provided).
             **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
         """
-        # Log any unexpected kwargs for debugging
-        if kwargs:
-            self.log_warning(f"Unexpected keyword arguments received: {kwargs}")
-
-        # Log the start of the job with input IPs for debugging
+        # Log all inputs for debugging
         self.log_info(
-            f"Starting network path tracing job with source_ip={data.get('source_ip', 'None')}, "
-            f"destination_ip={data.get('destination_ip', 'None')}"
+            f"Starting network path tracing job with data={data}, commit={commit}, "
+            f"source_ip={source_ip}, destination_ip={destination_ip}, kwargs={kwargs}"
         )
 
-        # Validate that input IPs are provided in the data dictionary
-        if not data.get("source_ip") or not data.get("destination_ip"):
-            error_msg = "Missing source_ip or destination_ip in job data"
+        # Handle inputs from either data dictionary or direct kwargs
+        if data and "source_ip" in data and "destination_ip" in data:
+            src_ip = data["source_ip"]
+            dst_ip = data["destination_ip"]
+        elif source_ip and destination_ip:
+            src_ip = source_ip
+            dst_ip = destination_ip
+        else:
+            error_msg = "Missing source_ip or destination_ip in job data or kwargs"
             self.log_failure(error_msg)
             raise ValueError(error_msg)
 
-        # Validate that input IPs are valid IPv4/IPv6 addresses
+        # Validate IP addresses
         try:
-            ipaddress.ip_address(data["source_ip"])
-            ipaddress.ip_address(data["destination_ip"])
+            ipaddress.ip_address(src_ip)
+            ipaddress.ip_address(dst_ip)
         except ValueError as exc:
             error_msg = f"Invalid IP address: {exc}"
             self.log_failure(error_msg)
@@ -78,8 +83,8 @@ class NetworkPathTracerJob(Job):
 
         # Initialize settings with normalized IP addresses
         settings = NetworkPathSettings(
-            source_ip=self._to_address_string(data["source_ip"]),
-            destination_ip=self._to_address_string(data["destination_ip"]),
+            source_ip=self._to_address_string(src_ip),
+            destination_ip=self._to_address_string(dst_ip),
         )
         self.log_info(
             f"Normalized settings: source_ip={settings.source_ip}, "
@@ -171,7 +176,7 @@ class NetworkPathTracerJob(Job):
             self.log_failure(f"Unexpected error: {exc}")
             raise
 
-    def _store_path_result(self, payload: dict):
+    def _store_path_result(self, payload: dict) -> None:
         """Store the path tracing result in JobResult's custom_field_data.
 
         Args:
@@ -190,7 +195,7 @@ class NetworkPathTracerJob(Job):
         self.job_result.save()
 
     @staticmethod
-    def _to_address_string(value) -> str:
+    def _to_address_string(value: Any) -> str:
         """Normalize Nautobot job input to a plain string IP address.
 
         Args:

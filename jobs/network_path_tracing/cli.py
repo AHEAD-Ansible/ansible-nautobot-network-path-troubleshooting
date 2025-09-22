@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def select_data_source(settings: NetworkPathSettings, source: str):
+def select_data_source(settings: NetworkPathSettings, source: str) -> Any:
     """Return the configured Nautobot data source implementation."""
     if source == "api":
         api_settings = settings.api_settings()
@@ -85,7 +85,10 @@ def run_steps(
 
     print(f"Running validation for source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
     validation_step = InputValidationStep(source)
-    validation = validation_step.run(settings)
+    try:
+        validation = validation_step.run(settings)
+    except InputValidationError as exc:
+        raise InputValidationError(f"Validation failed: {exc}") from exc
 
     print(f"Running gateway discovery for prefix={validation.source_prefix.prefix}")
     gateway_step = GatewayDiscoveryStep(source, settings.gateway_custom_field)
@@ -134,11 +137,11 @@ def main(argv: list[str] | None = None) -> int:
             destination_ip=args.destination_ip,
         )
     except InputValidationError as exc:
-        payload = {"status": "error", "error": exc.message}
+        payload = {"status": "error", "error": str(exc)}
         print(json.dumps(payload, indent=2), file=sys.stdout)
         return 1
     except GatewayDiscoveryError as exc:
-        payload = {"status": "error", "error": exc.message}
+        payload = {"status": "error", "error": str(exc)}
         print(json.dumps(payload, indent=2), file=sys.stdout)
         return 1
     except Exception as exc:  # pragma: no cover - CLI guard
