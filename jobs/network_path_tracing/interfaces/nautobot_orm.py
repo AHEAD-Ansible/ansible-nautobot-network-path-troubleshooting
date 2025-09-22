@@ -19,13 +19,20 @@ class NautobotORMDataSource(NautobotDataSource):
     """Retrieve data directly from Nautobot's Django models."""
 
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
+        """Return the IPAddress record for the given address.
+
+        Args:
+            address (str): IP address without prefix (e.g., '10.0.0.1').
+
+        Returns:
+            Optional[IPAddressRecord]: The IP address record, or None if not found.
+        """
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
         print(f"Querying IPAddress for host={address}")  # Temporary debug
         ip_obj = (
             IPAddress.objects.filter(host=address)
-            .select_related("device", "assigned_object")
-            .prefetch_related("assigned_object__device", "assigned_object__virtual_machine")
+            .prefetch_related("interfaces__device", "interfaces__virtual_machine")
             .first()
         )
         print(f"Found IPAddress: {ip_obj}")  # Temporary debug
@@ -76,8 +83,7 @@ class NautobotORMDataSource(NautobotDataSource):
         filter_kwargs = {f"custom_field_data__{custom_field}": True, "parent": prefix_obj}
         ip_obj = (
             IPAddress.objects.filter(**filter_kwargs)
-            .select_related("device", "assigned_object")
-            .prefetch_related("assigned_object__device", "assigned_object__virtual_machine")
+            .prefetch_related("interfaces__device", "interfaces__virtual_machine")
             .first()
         )
         if ip_obj is None:
@@ -129,15 +135,16 @@ class NautobotORMDataSource(NautobotDataSource):
         """
         address = override_address or str(ip_obj.host)
         prefix_length = int(ip_obj.mask_length)
-        device_name = getattr(ip_obj.device, "name", None) if getattr(ip_obj, "device", None) else None
+        device_name = None
         interface_name = None
-        assigned = getattr(ip_obj, "assigned_object", None)
-        if assigned is not None:
-            interface_name = getattr(assigned, "name", None) or getattr(assigned, "display", None)
-            if not device_name and getattr(assigned, "device", None):
-                device_name = getattr(assigned.device, "name", None)
-            if not device_name and getattr(assigned, "virtual_machine", None):
-                device_name = getattr(assigned.virtual_machine, "name", None)
+        # Access the first related interface (if any)
+        interface = ip_obj.interfaces.first()
+        if interface:
+            interface_name = getattr(interface, "name", None) or getattr(interface, "display", None)
+            if getattr(interface, "device", None):
+                device_name = getattr(interface.device, "name", None)
+            elif getattr(interface, "virtual_machine", None):
+                device_name = getattr(interface.virtual_machine, "name", None)
         return IPAddressRecord(
             address=address,
             prefix_length=prefix_length,
