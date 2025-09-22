@@ -3,9 +3,9 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import responses
 
-from network_path_tracing.config import NautobotAPISettings
-from network_path_tracing.interfaces.nautobot import PrefixRecord
-from network_path_tracing.interfaces.nautobot_api import NautobotAPIDataSource
+from jobs.network_path_tracing import NautobotAPISettings
+from jobs.network_path_tracing.interfaces.nautobot import PrefixRecord
+from jobs.network_path_tracing import NautobotAPIDataSource
 
 
 @pytest.fixture()
