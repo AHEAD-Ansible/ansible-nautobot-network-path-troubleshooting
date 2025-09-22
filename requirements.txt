@@ -1,2 +1,4 @@
-ansible
 pynautobot
+requests>=2.31
+pytest
+responses

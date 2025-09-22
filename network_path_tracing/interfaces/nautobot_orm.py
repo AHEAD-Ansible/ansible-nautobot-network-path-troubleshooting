@@ -1,0 +1,102 @@
+"""Concrete Nautobot data source implementation backed by the ORM."""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from .nautobot import IPAddressRecord, NautobotDataSource, PrefixRecord
+
+try:  # Optional dependency when running outside Nautobot
+    from nautobot.ipam.models import IPAddress, Prefix
+except Exception:  # pragma: no cover - guards CLI tooling
+    IPAddress = None
+    Prefix = None
+
+
+class NautobotORMDataSource(NautobotDataSource):
+    """Retrieve data directly from Nautobot's Django models."""
+
+    def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
+        if IPAddress is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+
+        ip_obj = (
+            IPAddress.objects.filter(address__startswith=f"{address}/")
+            .select_related("device", "assigned_object")
+            .prefetch_related("assigned_object__device", "assigned_object__virtual_machine")
+            .first()
+        )
+        if ip_obj is None:
+            return None
+
+        return self._build_ip_record(ip_obj, override_address=address)
+
+    def get_most_specific_prefix(self, address: str) -> Optional[PrefixRecord]:
+        if Prefix is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+
+        prefix_obj = (
+            Prefix.objects.filter(prefix__net_contains_or_equals=address)
+            .order_by("-prefix_length")
+            .first()
+        )
+        if prefix_obj is None:
+            return None
+
+        status = prefix_obj.status.name if getattr(prefix_obj, "status", None) else None
+        return PrefixRecord(
+            id=str(prefix_obj.pk),
+            prefix=str(prefix_obj.prefix),
+            status=status,
+        )
+
+    def find_gateway_ip(
+        self, prefix: PrefixRecord, custom_field: str
+    ) -> Optional[IPAddressRecord]:
+        if IPAddress is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+
+        prefix_obj = Prefix.objects.filter(prefix=prefix.prefix).first() if Prefix else None
+        if prefix_obj is None:
+            return None
+
+        filter_kwargs = {f"custom_field_data__{custom_field}": True, "parent": prefix_obj}
+
+        ip_obj = (
+            IPAddress.objects.filter(**filter_kwargs)
+            .select_related("device", "assigned_object")
+            .prefetch_related("assigned_object__device", "assigned_object__virtual_machine")
+            .first()
+        )
+
+        if ip_obj is None:
+            return None
+
+        return self._build_ip_record(ip_obj)
+
+    # Helpers -----------------------------------------------------------------
+
+    def _build_ip_record(
+        self, ip_obj: Any, override_address: Optional[str] = None
+    ) -> IPAddressRecord:
+        address_value = override_address or str(ip_obj.address)
+        address = address_value.split("/")[0]
+        prefix_length = int(address_value.split("/")[1]) if "/" in address_value else int(str(ip_obj.address).split("/")[1])
+
+        device_name = getattr(ip_obj.device, "name", None) if getattr(ip_obj, "device", None) else None
+        interface_name = None
+
+        assigned = getattr(ip_obj, "assigned_object", None)
+        if assigned is not None:
+            interface_name = getattr(assigned, "name", None) or getattr(assigned, "display", None)
+            if not device_name and getattr(assigned, "device", None):
+                device_name = getattr(assigned.device, "name", None)
+            if not device_name and getattr(assigned, "virtual_machine", None):
+                device_name = getattr(assigned.virtual_machine, "name", None)
+
+        return IPAddressRecord(
+            address=address,
+            prefix_length=prefix_length,
+            device_name=device_name,
+            interface_name=interface_name,
+        )
