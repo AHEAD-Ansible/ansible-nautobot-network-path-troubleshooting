@@ -8,7 +8,7 @@ from typing import Optional
 
 from nautobot.apps.jobs import IPAddressVar, Job
 from nautobot.extras.models import CustomField
-from nautobot.extras.choices import LogLevelChoices
+from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
 from django.core.exceptions import ObjectDoesNotExist
 
 from .network_path_tracing import (
@@ -84,11 +84,7 @@ class NetworkPathTracerJob(Job):
             ipaddress.ip_address(source_ip)
             ipaddress.ip_address(destination_ip)
         except ValueError as exc:
-            self.logger.failure(
-                f"Invalid IP address: {exc}",
-                extra={"grouping": "input-validation"}
-            )
-            self.job_result.log(f"Invalid IP address: {exc}", level_choice=LogLevelChoices.LOG_FAILURE)
+            self._fail_job(f"Invalid IP address: {exc}", grouping="input-validation")
             raise ValueError(f"Invalid IP address: {exc}")
 
         # Initialize settings with normalized IP addresses
@@ -171,6 +167,7 @@ class NetworkPathTracerJob(Job):
 
             # Save result and mark success
             self.job_result.data = result_payload
+            self.job_result.set_status(JobResultStatusChoices.STATUS_SUCCESS)
             self.job_result.save()
             self.logger.success(
                 "Network path trace completed successfully",
@@ -205,7 +202,7 @@ class NetworkPathTracerJob(Job):
         """
         self.logger.failure(message, extra={"grouping": grouping, "object": self.job_result})
         self.job_result.log(message, level_choice=LogLevelChoices.LOG_FAILURE)
-        self.job_result.set_status(LogLevelChoices.LOG_FAILURE)
+        self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
         self.job_result.save()
         raise ValueError(message)
 
