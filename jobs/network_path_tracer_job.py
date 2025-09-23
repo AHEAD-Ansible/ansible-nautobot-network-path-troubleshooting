@@ -11,7 +11,7 @@ from nautobot.extras.models import CustomField
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
 from django.core.exceptions import ObjectDoesNotExist
 
-from .network_path_tracing import (
+from network_path_tracing import (
     GatewayDiscoveryError,
     GatewayDiscoveryStep,
     InputValidationError,
@@ -23,8 +23,9 @@ from .network_path_tracing import (
     PathTracingError,
     PathTracingStep,
 )
+from nautobot.apps.jobs import register_jobs
 
-
+@register_jobs
 class NetworkPathTracerJob(Job):
     """Trace the network path between source and destination IPs."""
 
