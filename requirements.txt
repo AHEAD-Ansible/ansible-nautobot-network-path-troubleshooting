@@ -2,3 +2,4 @@ pynautobot
 requests>=2.31
 pytest
 responses
+nautobot==2.4.14

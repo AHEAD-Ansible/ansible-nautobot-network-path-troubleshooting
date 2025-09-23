@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Set
 
 from ..config import NetworkPathSettings
-from ..exceptions import PathTracingError
-from ..interfaces.nautobot import NautobotDataSource, IPAddressRecord
+from ..exceptions import PathTracingError, NextHopDiscoveryError
+from ..interfaces.nautobot import NautobotDataSource, IPAddressRecord, PrefixRecord
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
 from .next_hop_discovery import NextHopDiscoveryResult, NextHopDiscoveryStep

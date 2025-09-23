@@ -9,7 +9,7 @@ from typing import Optional
 from nautobot.apps.jobs import IPAddressVar, Job
 from nautobot.extras.models import CustomField
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist, FieldError
 
 from network_path_tracing import (
     GatewayDiscoveryError,
@@ -201,8 +201,8 @@ class NetworkPathTracerJob(Job):
             message (str): The error message to log.
             grouping (str): The log grouping for structured logging.
         """
-        self.logger.failure(message, extra={"grouping": grouping, "object": self.job_result})
-        self.job_result.log(message, level_choice=LogLevelChoices.LOG_FAILURE)
+        self.logger.error(message, extra={"grouping": grouping, "object": self.job_result})
+        self.job_result.log(message, level_choice=LogLevelChoices.LOG_ERROR)
         self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
         self.job_result.save()
         raise ValueError(message)
@@ -214,8 +214,8 @@ class NetworkPathTracerJob(Job):
             payload (dict): The result payload to store.
         """
         try:
-            CustomField.objects.get(name="network_path_trace_results")
-        except ObjectDoesNotExist:
+            CustomField.objects.get(key="network_path_trace_results")
+        except CustomField.DoesNotExist:
             self.logger.warning(
                 "Custom field 'network_path_trace_results' not found; logging result instead",
                 extra={"grouping": "result-storage", "object": self.job_result}
@@ -225,6 +225,19 @@ class NetworkPathTracerJob(Job):
                 extra={"grouping": "result-storage", "object": self.job_result}
             )
             return
+        except FieldError as exc:
+            self.logger.error(
+                f"Custom field lookup failed: {exc}",
+                extra={"grouping": "result-storage", "object": self.job_result}
+            )
+            return
+
+        if hasattr(self.job_result, "cf"):
+            self.job_result.cf["network_path_trace_results"] = payload
+            save_method = getattr(self.job_result, "validated_save", None)
+            if callable(save_method):
+                save_method()
+                return
 
         self.job_result.custom_field_data["network_path_trace_results"] = payload
         self.job_result.save()

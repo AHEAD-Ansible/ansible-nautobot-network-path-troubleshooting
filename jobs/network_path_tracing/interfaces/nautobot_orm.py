@@ -29,13 +29,7 @@ class NautobotORMDataSource(NautobotDataSource):
         """
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
-        print(f"Querying IPAddress for host={address}")  # Temporary debug
-        ip_obj = (
-            IPAddress.objects.filter(host=address)
-            .prefetch_related("interfaces__device", "interfaces__virtual_machine")
-            .first()
-        )
-        print(f"Found IPAddress: {ip_obj}")  # Temporary debug
+        ip_obj = IPAddress.objects.filter(host=address).first()
         if ip_obj is None:
             return None
         return self._build_ip_record(ip_obj, override_address=address)
@@ -52,7 +46,7 @@ class NautobotORMDataSource(NautobotDataSource):
         if Prefix is None:
             raise RuntimeError("Nautobot is not available in this environment")
         prefix_obj = (
-            Prefix.objects.filter(prefix__net_contains_or_equals=address)
+            Prefix.objects.filter(network__net_contains_or_equals=address)
             .order_by("-prefix_length")
             .first()
         )
@@ -77,15 +71,19 @@ class NautobotORMDataSource(NautobotDataSource):
         """
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
-        prefix_obj = Prefix.objects.filter(prefix=prefix.prefix).first() if Prefix else None
+        prefix_obj = None
+        if Prefix is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+        if prefix.id:
+            prefix_obj = Prefix.objects.filter(pk=prefix.id).first()
+        elif prefix.prefix:
+            prefix_obj = Prefix.objects.filter(network__net_equals=prefix.prefix).first()
         if prefix_obj is None:
             return None
-        filter_kwargs = {f"custom_field_data__{custom_field}": True, "parent": prefix_obj}
-        ip_obj = (
-            IPAddress.objects.filter(**filter_kwargs)
-            .prefetch_related("interfaces__device", "interfaces__virtual_machine")
-            .first()
-        )
+        filter_kwargs = {"parent": prefix_obj}
+        if custom_field:
+            filter_kwargs[f"_custom_field_data__{custom_field}"] = True
+        ip_obj = IPAddress.objects.filter(**filter_kwargs).first()
         if ip_obj is None:
             return None
         return self._build_ip_record(ip_obj)
@@ -101,11 +99,7 @@ class NautobotORMDataSource(NautobotDataSource):
         """
         if Device is None:
             raise RuntimeError("Nautobot is not available in this environment")
-        device_obj = (
-            Device.objects.filter(name=name)
-            .select_related("primary_ip4", "platform")
-            .first()
-        )
+        device_obj = Device.objects.filter(**{"name": name}).select_related("primary_ip4", "platform").first()
         if not device_obj:
             return None
         primary_ip = None
@@ -114,8 +108,12 @@ class NautobotORMDataSource(NautobotDataSource):
         platform_slug = None
         platform_name = None
         if device_obj.platform:
-            platform_slug = device_obj.platform.slug
-            platform_name = device_obj.platform.name
+            platform_name = getattr(device_obj.platform, "name", None)
+            platform_slug = getattr(device_obj.platform, "slug", None)
+            if platform_slug is None:
+                platform_slug = getattr(device_obj.platform, "identifier", None)
+            if platform_slug is None:
+                platform_slug = getattr(device_obj.platform, "napalm_driver", None)
         return DeviceRecord(
             name=device_obj.name,
             primary_ip=primary_ip,
@@ -138,13 +136,17 @@ class NautobotORMDataSource(NautobotDataSource):
         device_name = None
         interface_name = None
         # Access the first related interface (if any)
-        interface = ip_obj.interfaces.first()
+        interface = None
+        if hasattr(ip_obj, "assigned_object") and ip_obj.assigned_object is not None:
+            interface = ip_obj.assigned_object
+        elif hasattr(ip_obj, "interface") and ip_obj.interface is not None:
+            interface = ip_obj.interface
+        elif hasattr(ip_obj, "interfaces"):
+            interface = ip_obj.interfaces.first()
         if interface:
             interface_name = getattr(interface, "name", None) or getattr(interface, "display", None)
             if getattr(interface, "device", None):
                 device_name = getattr(interface.device, "name", None)
-            elif getattr(interface, "virtual_machine", None):
-                device_name = getattr(interface.virtual_machine, "name", None)
         return IPAddressRecord(
             address=address,
             prefix_length=prefix_length,

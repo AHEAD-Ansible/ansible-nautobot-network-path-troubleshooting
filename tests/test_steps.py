@@ -1,18 +1,19 @@
-"""Unit tests for network path tracing steps and job."""
+"""Unit tests for individual network path tracing steps."""
 
 import pytest
-from unittest.mock import MagicMock
 
-from nautobot.extras.choices import LogLevelChoices
 from jobs.network_path_tracing import NetworkPathSettings
 from jobs.network_path_tracing import GatewayDiscoveryError, InputValidationError
 from jobs.network_path_tracing.interfaces.nautobot import IPAddressRecord, PrefixRecord
 from jobs.network_path_tracing.steps import (
+    GatewayDiscoveryResult,
     GatewayDiscoveryStep,
     InputValidationResult,
     InputValidationStep,
+    NextHopDiscoveryResult,
+    PathTracingStep,
 )
-from jobs.network_path_tracer_job import NetworkPathTracerJob
+import jobs.network_path_tracing.steps.path_tracing as path_tracing_module
 
 
 class FakeDataSource:
@@ -103,54 +104,6 @@ def test_input_validation_missing_prefix(default_settings, source_ip_record):
     assert "No containing prefix" in str(excinfo.value)
 
 
-def test_network_path_tracer_job_run():
-    """Test job run with valid inputs."""
-    job = NetworkPathTracerJob()
-    job.logger = MagicMock()
-    job.job_result = MagicMock()
-    with pytest.raises(InputValidationError, match="Source IP 10.0.0.1 not found"):
-        job.run(source_ip="10.0.0.1", destination_ip="4.2.2.1")
-    job.logger.info.assert_any_call(
-        "Starting network path tracing job for source_ip=10.0.0.1, destination_ip=4.2.2.1",
-        extra={"grouping": "job-start", "object": job.job_result}
-    )
-    job.job_result.log.assert_any_call("Job has started.", level_choice=LogLevelChoices.LOG_INFO)
-
-
-def test_network_path_tracer_job_invalid_ip():
-    """Test job run with invalid IP address."""
-    job = NetworkPathTracerJob()
-    job.logger = MagicMock()
-    job.job_result = MagicMock()
-    with pytest.raises(ValueError, match="Invalid IP address"):
-        job.run(source_ip="invalid-ip", destination_ip="4.2.2.1")
-    job.logger.failure.assert_called_with(
-        "Invalid IP address: Invalid address format for invalid-ip",
-        extra={"grouping": "input-validation"}
-    )
-    job.job_result.log.assert_called_with(
-        "Invalid IP address: Invalid address format for invalid-ip",
-        level_choice=LogLevelChoices.LOG_FAILURE
-    )
-
-
-def test_network_path_tracer_job_missing_inputs():
-    """Test job run with missing inputs."""
-    job = NetworkPathTracerJob()
-    job.logger = MagicMock()
-    job.job_result = MagicMock()
-    with pytest.raises(ValueError, match="Missing source_ip or destination_ip"):
-        job.run(source_ip="10.0.0.1")
-    job.logger.failure.assert_called_with(
-        "Missing source_ip or destination_ip in job data or kwargs",
-        extra={"grouping": "input-validation"}
-    )
-    job.job_result.log.assert_called_with(
-        "Missing source_ip or destination_ip in job data or kwargs",
-        level_choice=LogLevelChoices.LOG_FAILURE
-    )
-
-
 def test_gateway_direct_host(prefix_record, source_ip_record):
     validation = build_validation_result(prefix_record, source_ip_record, is_host=True)
 
@@ -239,3 +192,133 @@ def build_validation_result(
         source_prefix=prefix,
         is_host_ip=is_host,
     )
+
+
+class PathDataSource(FakeDataSource):
+    """Data source that only needs get_ip_address for path tracing tests."""
+
+    def __init__(self, ip_records: dict[str, IPAddressRecord]) -> None:
+        super().__init__(ip_records=ip_records, prefix_record=None, gateway_record=None)
+
+
+@pytest.fixture
+def path_gateway() -> GatewayDiscoveryResult:
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="edge-1",
+        interface_name="Gig0/0",
+    )
+    return GatewayDiscoveryResult(found=True, method="custom", gateway=gateway)
+
+
+@pytest.fixture
+def path_validation(source_ip_record, prefix_record) -> InputValidationResult:
+    return build_validation_result(prefix_record, source_ip_record, is_host=False)
+
+
+def test_path_tracing_reaches_destination(monkeypatch, default_settings, path_gateway, path_validation):
+    """Path tracing should record a successful hop when next-hop equals destination."""
+
+    next_hop_result = NextHopDiscoveryResult(
+        found=True,
+        next_hops=[{"next_hop_ip": default_settings.destination_ip, "egress_interface": "Gig0/1"}],
+        details="direct",
+    )
+
+    class StubNextHop:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def run(self, _validation, _gateway):
+            return next_hop_result
+
+    monkeypatch.setattr(path_tracing_module, "NextHopDiscoveryStep", StubNextHop)
+
+    data_source = PathDataSource(ip_records={})
+    step = PathTracingStep(data_source, default_settings)
+
+    result = step.run(path_validation, path_gateway)
+
+    assert len(result.paths) == 1
+    path = result.paths[0]
+    assert path.reached_destination is True
+    assert path.hops[0].next_hop_ip == default_settings.destination_ip
+
+
+def test_path_tracing_blackhole(monkeypatch, default_settings, path_gateway, path_validation):
+    """Path tracing should flag routing blackholes when no next hop is found."""
+
+    next_hop_result = NextHopDiscoveryResult(found=False, next_hops=[], details="no route")
+
+    class StubNextHop:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def run(self, _validation, _gateway):
+            return next_hop_result
+
+    monkeypatch.setattr(path_tracing_module, "NextHopDiscoveryStep", StubNextHop)
+
+    data_source = PathDataSource(ip_records={})
+    step = PathTracingStep(data_source, default_settings)
+
+    result = step.run(path_validation, path_gateway)
+
+    assert len(result.paths) == 1
+    path = result.paths[0]
+    assert path.reached_destination is False
+    assert any("blackhole" in issue for issue in path.issues)
+    assert path.hops[0].details == "no route"
+
+
+def test_path_tracing_multiple_hops(monkeypatch, default_settings, path_gateway, path_validation):
+    """Path tracing should follow multiple hops until the destination is reached."""
+
+    hop_sequence = [
+        NextHopDiscoveryResult(
+            found=True,
+            next_hops=[{"next_hop_ip": "10.10.20.1", "egress_interface": "Gig0/1"}],
+            details="toward agg",
+        ),
+        NextHopDiscoveryResult(
+            found=True,
+            next_hops=[{"next_hop_ip": default_settings.destination_ip, "egress_interface": "Gig0/2"}],
+            details="toward dest",
+        ),
+    ]
+
+    def pop_result() -> NextHopDiscoveryResult:
+        if hop_sequence:
+            return hop_sequence.pop(0)
+        return NextHopDiscoveryResult(found=False, next_hops=[], details="exhausted")
+
+    class SequencedNextHop:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def run(self, _validation, _gateway):
+            return pop_result()
+
+    monkeypatch.setattr(path_tracing_module, "NextHopDiscoveryStep", SequencedNextHop)
+
+    data_source = PathDataSource(
+        ip_records={
+            "10.10.20.1": IPAddressRecord(
+                address="10.10.20.1",
+                prefix_length=24,
+                device_name="agg-1",
+                interface_name="Gig1/0",
+            )
+        }
+    )
+    step = PathTracingStep(data_source, default_settings)
+
+    result = step.run(path_validation, path_gateway)
+
+    assert len(result.paths) == 1
+    path = result.paths[0]
+    assert path.reached_destination is True
+    assert len(path.hops) == 2
+    assert path.hops[0].next_hop_ip == "10.10.20.1"
+    assert path.hops[1].next_hop_ip == default_settings.destination_ip
