@@ -1,2 +1,11 @@
 /venv
 /REFERENCE
+/network_path_tracing/__pycache__/
+.pytest_cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.log
