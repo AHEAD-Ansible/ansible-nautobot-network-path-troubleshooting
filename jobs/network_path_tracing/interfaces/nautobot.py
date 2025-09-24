@@ -30,6 +30,7 @@ class DeviceRecord:
     primary_ip: Optional[str] = None
     platform_slug: Optional[str] = None
     platform_name: Optional[str] = None
+    napalm_driver: Optional[str] = None
 
 
 class NautobotDataSource(Protocol):

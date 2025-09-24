@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Set
 
+import logging
+
 from ..config import NetworkPathSettings
 from ..exceptions import PathTracingError, NextHopDiscoveryError
 from ..interfaces.nautobot import NautobotDataSource, IPAddressRecord, PrefixRecord
@@ -40,11 +42,19 @@ class PathTracingResult:
 
 class PathTracingStep:
     """Trace the full path from gateway to destination, handling ECMP."""
-    def __init__(self, data_source: NautobotDataSource, settings: NetworkPathSettings):
+    def __init__(
+        self,
+        data_source: NautobotDataSource,
+        settings: NetworkPathSettings,
+        next_hop_step: NextHopDiscoveryStep,
+        logger: Optional[logging.Logger] = None,
+    ):
         self._data_source = data_source
         self._settings = settings
         self._max_hops = 10
         self._max_failed_hops = 3
+        self._logger = logger
+        self._next_hop_step = next_hop_step
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> PathTracingResult:
         """Execute the path tracing workflow."""
@@ -94,9 +104,8 @@ class PathTracingStep:
             issues.append(f"Too many failed hops ({failed_hops}); potential routing issue.")
             paths.append(Path(hops=current_hops, reached_destination=False, issues=issues[:]))
             return
-        next_hop_step = NextHopDiscoveryStep(self._data_source, self._settings)
         try:
-            next_hop_result = next_hop_step.run(
+            next_hop_result = self._next_hop_step.run(
                 InputValidationResult(
                     source_ip=self._settings.source_ip,
                     destination_ip=destination_ip,

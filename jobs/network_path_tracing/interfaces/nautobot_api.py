@@ -97,14 +97,22 @@ class NautobotAPIDataSource(NautobotDataSource):
         platform = device.get("platform")
         platform_slug = None
         platform_name = None
+        napalm_driver = None
         if isinstance(platform, dict):
-            platform_slug = platform.get("slug")
+            platform_slug = platform.get("slug") or platform.get("identifier")
             platform_name = platform.get("name")
+            mappings = platform.get("network_driver_mappings")
+            if isinstance(mappings, dict):
+                napalm_driver = mappings.get("napalm") or mappings.get("napalm", None)
+            napalm_driver = napalm_driver or platform.get("napalm_driver")
+            if not platform_slug and napalm_driver:
+                platform_slug = napalm_driver
         return DeviceRecord(
             name=str(device.get("name") or device.get("display") or name),
             primary_ip=primary_ip,
             platform_slug=platform_slug,
             platform_name=platform_name,
+            napalm_driver=napalm_driver,
         )
 
     def _ensure_prefix_id(self, prefix: PrefixRecord) -> str:

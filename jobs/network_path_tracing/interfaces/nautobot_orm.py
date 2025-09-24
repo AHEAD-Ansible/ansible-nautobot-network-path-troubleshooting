@@ -107,18 +107,24 @@ class NautobotORMDataSource(NautobotDataSource):
             primary_ip = str(device_obj.primary_ip4.host)
         platform_slug = None
         platform_name = None
+        napalm_driver = None
         if device_obj.platform:
-            platform_name = getattr(device_obj.platform, "name", None)
-            platform_slug = getattr(device_obj.platform, "slug", None)
-            if platform_slug is None:
-                platform_slug = getattr(device_obj.platform, "identifier", None)
-            if platform_slug is None:
-                platform_slug = getattr(device_obj.platform, "napalm_driver", None)
+            platform = device_obj.platform
+            platform_name = getattr(platform, "name", None)
+            platform_slug = getattr(platform, "slug", None) or getattr(platform, "identifier", None)
+            network_mappings = getattr(platform, "network_driver_mappings", None)
+            if isinstance(network_mappings, dict):
+                napalm_driver = network_mappings.get("napalm") or network_mappings.get("napalm", None)
+            if not napalm_driver:
+                napalm_driver = getattr(platform, "napalm_driver", None)
+            if not platform_slug and isinstance(napalm_driver, str):
+                platform_slug = napalm_driver
         return DeviceRecord(
             name=device_obj.name,
             primary_ip=primary_ip,
             platform_slug=platform_slug,
             platform_name=platform_name,
+            napalm_driver=napalm_driver,
         )
 
     def _build_ip_record(self, ip_obj: Any, override_address: Optional[str] = None) -> IPAddressRecord:

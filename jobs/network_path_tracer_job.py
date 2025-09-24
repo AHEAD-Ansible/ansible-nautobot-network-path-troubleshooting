@@ -102,8 +102,8 @@ class NetworkPathTracerJob(Job):
         data_source = NautobotORMDataSource()
         validation_step = InputValidationStep(data_source)
         gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
-        next_hop_step = NextHopDiscoveryStep(data_source, settings)
-        path_tracing_step = PathTracingStep(data_source, settings)
+        next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)
+        path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
 
         try:
             # Step 1: Validate inputs
