@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Set
-
-import logging
 
 from ..config import NetworkPathSettings
 from ..exceptions import PathTracingError, NextHopDiscoveryError
@@ -141,16 +141,30 @@ class PathTracingStep:
             next_hop_ip = next_hop["next_hop_ip"]
             egress_if = next_hop["egress_interface"]
             next_hop_record = self._data_source.get_ip_address(next_hop_ip) if next_hop_ip else None
-            current_hops.append(PathHop(
+            hop_entry = PathHop(
                 device_name=current_device,
                 interface_name=current_interface,
                 next_hop_ip=next_hop_ip,
                 egress_interface=egress_if,
                 details=next_hop_result.details
-            ))
-            if next_hop_ip == destination_ip or (next_hop_record and next_hop_record.prefix_length == 32):
-                paths.append(Path(hops=current_hops[:], reached_destination=True, issues=issues[:]))
+            )
+            current_hops.append(hop_entry)
+
+            is_destination = False
+            if next_hop_ip == destination_ip:
+                is_destination = True
+            elif self._is_destination_within_next_hop(next_hop_record, destination_ip):
+                is_destination = True
+
+            if is_destination:
+                destination_hop = self._build_destination_hop(destination_ip)
+                path_hops = current_hops[:]
+                if destination_hop:
+                    path_hops.append(destination_hop)
+                paths.append(Path(hops=path_hops, reached_destination=True, issues=issues[:]))
+                current_hops.pop()
                 continue
+
             next_device = next_hop_record.device_name if next_hop_record else None
             next_interface = next_hop_record.interface_name if next_hop_record else egress_if
             self._trace_path(
@@ -163,3 +177,44 @@ class PathTracingStep:
                 issues=issues,
                 seen_devices=seen_devices.copy()
             )
+            current_hops.pop()
+
+    def _is_destination_within_next_hop(
+        self,
+        next_hop_record: Optional[IPAddressRecord],
+        destination_ip: str,
+    ) -> bool:
+        """Return True if destination IP resides on the same subnet as the next hop."""
+
+        if not next_hop_record or not next_hop_record.address or not next_hop_record.prefix_length:
+            return False
+        try:
+            network = ipaddress.ip_network(
+                f"{next_hop_record.address}/{next_hop_record.prefix_length}",
+                strict=False,
+            )
+            return ipaddress.ip_address(destination_ip) in network
+        except ValueError:
+            return False
+
+    def _build_destination_hop(self, destination_ip: str) -> Optional[PathHop]:
+        """Construct the final hop describing the destination device."""
+
+        dest_record = self._data_source.get_ip_address(destination_ip)
+        if dest_record:
+            details = "Destination device resolved via Nautobot"
+            return PathHop(
+                device_name=dest_record.device_name,
+                interface_name=dest_record.interface_name,
+                next_hop_ip=destination_ip,
+                egress_interface=None,
+                details=details,
+            )
+
+        return PathHop(
+            device_name="device_info: Not Found",
+            interface_name=None,
+            next_hop_ip=destination_ip,
+            egress_interface=None,
+            details="Destination device info not found in Nautobot",
+        )

@@ -234,7 +234,13 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
         details="direct",
     )
 
-    data_source = PathDataSource(ip_records={})
+    dest_record = IPAddressRecord(
+        address=default_settings.destination_ip,
+        prefix_length=32,
+        device_name="dest-host",
+        interface_name="eth0",
+    )
+    data_source = PathDataSource(ip_records={default_settings.destination_ip: dest_record})
     class StubNextHopStep:
         def run(self, *_args, **_kwargs):  # noqa: D401
             return next_hop_result
@@ -246,7 +252,10 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
     assert len(result.paths) == 1
     path = result.paths[0]
     assert path.reached_destination is True
+    assert len(path.hops) == 2
     assert path.hops[0].next_hop_ip == default_settings.destination_ip
+    assert path.hops[1].device_name == "dest-host"
+    assert path.hops[1].details == "Destination device resolved via Nautobot"
 
 
 def test_path_tracing_blackhole(default_settings, path_gateway, path_validation):
@@ -286,6 +295,12 @@ def test_path_tracing_multiple_hops(default_settings, path_gateway, path_validat
         ),
     ]
 
+    dest_record = IPAddressRecord(
+        address=default_settings.destination_ip,
+        prefix_length=32,
+        device_name="dest-host",
+        interface_name="eth0",
+    )
     data_source = PathDataSource(
         ip_records={
             "10.10.20.1": IPAddressRecord(
@@ -293,7 +308,8 @@ def test_path_tracing_multiple_hops(default_settings, path_gateway, path_validat
                 prefix_length=24,
                 device_name="agg-1",
                 interface_name="Gig1/0",
-            )
+            ),
+            default_settings.destination_ip: dest_record,
         }
     )
     class SequencedNextHopStep:
@@ -309,9 +325,36 @@ def test_path_tracing_multiple_hops(default_settings, path_gateway, path_validat
     assert len(result.paths) == 1
     path = result.paths[0]
     assert path.reached_destination is True
-    assert len(path.hops) == 2
+    assert len(path.hops) == 3
     assert path.hops[0].next_hop_ip == "10.10.20.1"
     assert path.hops[1].next_hop_ip == default_settings.destination_ip
+    assert path.hops[2].device_name == "dest-host"
+
+
+def test_path_tracing_destination_info_missing(default_settings, path_gateway, path_validation):
+    """Destination hop should be appended even when Nautobot lacks device info."""
+
+    next_hop_result = NextHopDiscoveryResult(
+        found=True,
+        next_hops=[{"next_hop_ip": default_settings.destination_ip, "egress_interface": "Gig0/1"}],
+        details="direct",
+    )
+
+    data_source = PathDataSource(ip_records={})
+
+    class StubNextHopStep:
+        def run(self, *_args, **_kwargs):  # noqa: D401
+            return next_hop_result
+
+    step = PathTracingStep(data_source, default_settings, StubNextHopStep())
+
+    result = step.run(path_validation, path_gateway)
+
+    path = result.paths[0]
+    assert path.reached_destination is True
+    assert len(path.hops) == 2
+    assert path.hops[-1].device_name == "device_info: Not Found"
+    assert "not found" in path.hops[-1].details.lower()
 
 
 class NextHopDataSource:
@@ -609,6 +652,96 @@ def test_next_hop_nxos_fallback_to_ssh(monkeypatch):
     assert calls == ["nxos", "nxos_ssh"]
 
 
+def test_next_hop_nxos_vrf_lookup(monkeypatch):
+    """NX-OS CLI should search VRFs when the default table lacks the route."""
+
+    responses: dict[str, dict] = {}
+
+    base_payload = {"TABLE_vrf": {"ROW_vrf": []}}
+    responses[f"show ip route 10.20.20.20 | json"] = {"show ip route 10.20.20.20 | json": json.dumps(base_payload)}
+    vrf_payload = {
+        "TABLE_vrf": {
+            "ROW_vrf": [
+                {"vrf_name": "blue"},
+                {"vrf_name": "default"},
+            ]
+        }
+    }
+    responses["show vrf | json"] = {"show vrf | json": json.dumps(vrf_payload)}
+    vrf_route_payload = {
+        "TABLE_vrf": {
+            "ROW_vrf": {
+                "TABLE_addr": {
+                    "ROW_addr": {
+                        "TABLE_path": {
+                            "ROW_path": {
+                                "nexthop": "10.10.60.1",
+                                "ifname": "Ethernet1/6",
+                                "ubest": "true",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    responses["show ip route vrf blue 10.20.20.20 | json"] = {
+        "show ip route vrf blue 10.20.20.20 | json": json.dumps(vrf_route_payload)
+    }
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def cli(self, commands):  # noqa: D401
+            cmd = commands[0]
+            payload = responses.get(cmd)
+            if payload is None:
+                raise AssertionError(f"Unexpected command {cmd}")
+            return payload
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "nxos_ssh"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.10.10.10",
+        destination_ip="10.20.20.20",
+        napalm=NapalmSettings(username="u", password="p"),
+    )
+    device = DeviceRecord(
+        name="NX-VRF",
+        primary_ip="192.0.2.41",
+        platform_slug="cisco_nxos",
+        platform_name="NX-OS",
+        napalm_driver="nxos_ssh",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="NX-VRF",
+        interface_name="Vlan401",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert result.next_hops == [{"next_hop_ip": "10.10.60.1", "egress_interface": "Ethernet1/6"}]
+
+
 def test_next_hop_caches_results(monkeypatch):
     """Repeated lookups for the same device/destination should reuse cached data."""
 
@@ -670,3 +803,81 @@ def test_next_hop_caches_results(monkeypatch):
 
     assert first == second
     assert calls.count("ios") == 1
+
+
+def test_nxos_prefix_table_format(monkeypatch):
+    """NX-OS TABLE_addrf format should be parsed correctly."""
+
+    payload = {
+        "TABLE_vrf": {
+            "ROW_vrf": {
+                "vrf-name-out": "default",
+                "TABLE_addrf": {
+                    "ROW_addrf": {
+                        "addrf": "ipv4",
+                        "TABLE_prefix": {
+                            "ROW_prefix": {
+                                "ipprefix": "10.200.200.0/24",
+                                "TABLE_path": {
+                                    "ROW_path": {
+                                        "entry": "0",
+                                        "ipnexthop": "10.200.200.1",
+                                        "ifname": "Vlan200",
+                                        "ubest": "true",
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    }
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def cli(self, commands):  # noqa: D401
+            cmd = commands[0]
+            return {cmd: json.dumps(payload)}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.10.10.10",
+        destination_ip="10.200.200.200",
+        napalm=NapalmSettings(username="u", password="p"),
+    )
+    device = DeviceRecord(
+        name="NX-Prefix",
+        primary_ip="192.0.2.42",
+        platform_slug="cisco_nxos",
+        platform_name="NX-OS",
+        napalm_driver="nxos_ssh",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="NX-Prefix",
+        interface_name="Vlan402",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert result.next_hops == [{"next_hop_ip": "10.200.200.1", "egress_interface": "Vlan200"}]

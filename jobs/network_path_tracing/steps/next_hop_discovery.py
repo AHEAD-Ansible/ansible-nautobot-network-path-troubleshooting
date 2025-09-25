@@ -135,7 +135,7 @@ class NextHopDiscoveryStep:
                     optional_args=optional_args,
                 ) as device_conn:
                     if candidate in self._NXOS_DRIVERS:
-                        next_hops = self._collect_nxos_routes(device_conn, destination_ip)
+                        next_hops = self._collect_nxos_routes(device_conn, destination_ip, ingress_if)
                         details = f"Resolved via NX-OS CLI on '{device.name}'"
                     else:
                         next_hops = self._collect_generic_routes(device_conn, destination_ip)
@@ -247,78 +247,136 @@ class NextHopDiscoveryStep:
                     )
         return next_hops
 
-    def _collect_nxos_routes(self, device_conn, destination_ip: str) -> List[dict]:
+    def _collect_nxos_routes(self, device_conn, destination_ip: str, ingress_if: str) -> List[dict]:
         """Collect next-hop information for NX-OS platforms via CLI JSON."""
 
-        command = f"show ip route {destination_ip} | json"
+        vrf_candidates: List[Optional[str]] = []
+        interface_vrf = self._detect_nxos_interface_vrf(device_conn, ingress_if)
+        if interface_vrf:
+            vrf_candidates.append(interface_vrf)
+
+        vrf_candidates.append(None)
+
+        all_vrfs = self._fetch_nxos_vrfs(device_conn)
+        for vrf in all_vrfs:
+            if vrf not in vrf_candidates:
+                vrf_candidates.append(vrf)
+
+        for vrf in vrf_candidates:
+            command = (
+                f"show ip route {destination_ip} | json"
+                if vrf in (None, "default")
+                else f"show ip route vrf {vrf} {destination_ip} | json"
+            )
+            data = self._run_nxos_cli(device_conn, command)
+            if data is None:
+                continue
+            hops = self._parse_nxos_route_payload(data)
+            if hops:
+                return hops
+
+        return self._collect_generic_routes(device_conn, destination_ip)
+
+    def _run_nxos_cli(self, device_conn, command: str) -> Optional[dict]:
+        """Run an NX-OS CLI command and return parsed JSON data."""
+
         try:
             response = device_conn.cli([command])
         except Exception as exc:  # pragma: no cover - transport errors fallback to generic handler
             if self._logger:
                 self._logger.info(
-                    f"NX-OS CLI lookup failed ({exc}); falling back to generic route lookup",
+                    f"NX-OS CLI lookup failed for '{command}': {exc}",
                     extra={"grouping": "next-hop-discovery"},
                 )
-            return self._collect_generic_routes(device_conn, destination_ip)
+            return None
 
         raw_payload = response.get(command)
         if raw_payload is None:
             if self._logger:
                 self._logger.info(
-                    "NX-OS CLI returned no payload; falling back to generic route lookup",
+                    f"NX-OS CLI returned no payload for '{command}'",
                     extra={"grouping": "next-hop-discovery"},
                 )
-            return self._collect_generic_routes(device_conn, destination_ip)
+            return None
 
         try:
             if isinstance(raw_payload, str):
-                data = json.loads(raw_payload)
-            elif isinstance(raw_payload, dict):
-                data = raw_payload
-            else:
-                raise ValueError(f"Unsupported NX-OS CLI payload type: {type(raw_payload)}")
+                return json.loads(raw_payload)
+            if isinstance(raw_payload, dict):
+                return raw_payload
+            raise ValueError(f"Unsupported NX-OS CLI payload type: {type(raw_payload)}")
         except (json.JSONDecodeError, ValueError) as exc:
             if self._logger:
                 self._logger.info(
-                    f"NX-OS JSON parsing failed ({exc}); falling back to generic route lookup",
+                    f"NX-OS JSON parsing failed for '{command}': {exc}",
                     extra={"grouping": "next-hop-discovery"},
                 )
-            return self._collect_generic_routes(device_conn, destination_ip)
+            return None
+
+    def _parse_nxos_route_payload(self, data: dict) -> List[dict]:
+        """Translate NX-OS JSON route payload into generic next-hop entries."""
 
         def as_list(value):
             if isinstance(value, list):
                 return value
-            if value:
-                return [value]
-            return []
+            if value is None:
+                return []
+            return [value]
 
         results = []
         vrf_table = data.get("TABLE_vrf", {})
         for vrf_node in as_list(vrf_table.get("ROW_vrf")):
-            vrf_name = vrf_node.get("vrf_name") or "default"
-            addr_table = vrf_node.get("TABLE_addr", {})
-            for addr in as_list(addr_table.get("ROW_addr")):
-                path_table = addr.get("TABLE_path", {})
-                for path in as_list(path_table.get("ROW_path")):
-                    next_hop = path.get("nexthop") or path.get("nhaddr")
-                    interface = path.get("ifname") or path.get("ifname_out")
-                    best_flag = str(path.get("ubest", "")).lower()
-                    is_best = best_flag in {"true", "1", "yes"}
-                    results.append(
-                        {
-                            "next_hop": next_hop,
-                            "interface": interface,
-                            "is_best": is_best,
-                        }
-                    )
+            addr_tables = []
+            if "TABLE_addr" in vrf_node:
+                addr_tables.append(("TABLE_addr", "ROW_addr"))
+            if "TABLE_addrf" in vrf_node:
+                addr_tables.append(("TABLE_addrf", "ROW_addrf"))
+            if not addr_tables:
+                addr_tables.append((None, None))
+
+            for table_key, row_key in addr_tables:
+                table_obj = vrf_node.get(table_key) if table_key else vrf_node
+                if not isinstance(table_obj, dict):
+                    continue
+                addr_rows = as_list(table_obj.get(row_key)) if row_key else [table_obj]
+                for addr in addr_rows:
+                    prefixes = []
+                    if isinstance(addr, dict) and "TABLE_prefix" in addr:
+                        prefixes = as_list(addr.get("TABLE_prefix", {}).get("ROW_prefix"))
+                    elif isinstance(addr, dict):
+                        prefixes = [addr]
+                    else:
+                        continue
+
+                    for prefix in prefixes:
+                        if not isinstance(prefix, dict):
+                            continue
+                        path_table = prefix.get("TABLE_path", {}) if isinstance(prefix.get("TABLE_path"), dict) else {}
+                        for path in as_list(path_table.get("ROW_path")):
+                            if not isinstance(path, dict):
+                                continue
+                            next_hop = (
+                                path.get("nexthop")
+                                or path.get("nhaddr")
+                                or path.get("ipnexthop")
+                            )
+                            interface = (
+                                path.get("ifname")
+                                or path.get("ifname_out")
+                                or path.get("interface")
+                            )
+                            best_flag = str(path.get("ubest", "")).lower()
+                            is_best = best_flag in {"true", "1", "yes"}
+                            results.append(
+                                {
+                                    "next_hop": next_hop,
+                                    "interface": interface,
+                                    "is_best": is_best,
+                                }
+                            )
 
         if not results:
-            if self._logger:
-                self._logger.info(
-                    "NX-OS CLI returned no usable paths; falling back to generic route lookup",
-                    extra={"grouping": "next-hop-discovery"},
-                )
-            return self._collect_generic_routes(device_conn, destination_ip)
+            return []
 
         best_results = [entry for entry in results if entry["is_best"]]
         chosen = best_results or results
@@ -333,3 +391,53 @@ class NextHopDiscoveryStep:
                     }
                 )
         return next_hops
+
+    def _fetch_nxos_vrfs(self, device_conn) -> List[str]:
+        """Return a list of VRF names configured on the NX-OS device."""
+
+        command = "show vrf | json"
+        data = self._run_nxos_cli(device_conn, command)
+        if not data:
+            return []
+
+        vrfs = []
+
+        def as_list(value):
+            if isinstance(value, list):
+                return value
+            if value:
+                return [value]
+            return []
+
+        table = data.get("TABLE_vrf", {})
+        for vrf in as_list(table.get("ROW_vrf")):
+            name = vrf.get("vrf_name")
+            if isinstance(name, str) and name.lower() != "management":
+                vrfs.append(name)
+        return vrfs
+
+    def _detect_nxos_interface_vrf(self, device_conn, interface: str) -> Optional[str]:
+        """Return the VRF name associated with an interface, if any."""
+
+        if not interface:
+            return None
+
+        command = f"show ip interface {interface} | json"
+        data = self._run_nxos_cli(device_conn, command)
+        if not data:
+            return None
+
+        table = data.get("TABLE_intf", {})
+
+        def as_list(value):
+            if isinstance(value, list):
+                return value
+            if value:
+                return [value]
+            return []
+
+        for entry in as_list(table.get("ROW_intf")):
+            vrf = entry.get("vrf") or entry.get("vrf_name") or entry.get("vrf_id")
+            if isinstance(vrf, str) and vrf.lower() != "default":
+                return vrf
+        return None
