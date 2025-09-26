@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Any
 
 
 @dataclass
@@ -43,3 +43,5 @@ class NautobotDataSource(Protocol):
         """Return the gateway IP within ``prefix`` tagged via ``custom_field`` if present."""
     def get_device(self, name: str) -> Optional[DeviceRecord]:
         """Return the Device record for ``name`` if it exists."""
+    def get_interface(self, device_name: str, interface_name: str) -> Optional[Any]:
+        """Return the Interface record for the given device and interface name."""

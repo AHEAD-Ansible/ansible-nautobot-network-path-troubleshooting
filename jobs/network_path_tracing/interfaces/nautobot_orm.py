@@ -8,25 +8,19 @@ from .nautobot import IPAddressRecord, NautobotDataSource, PrefixRecord, DeviceR
 
 try:
     from nautobot.ipam.models import IPAddress, Prefix
-    from nautobot.dcim.models import Device
+    from nautobot.dcim.models import Device, Interface
 except Exception:
     IPAddress = None
     Prefix = None
     Device = None
+    Interface = None
 
 
 class NautobotORMDataSource(NautobotDataSource):
     """Retrieve data directly from Nautobot's Django models."""
 
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
-        """Return the IPAddress record for the given address.
-
-        Args:
-            address (str): IP address without prefix (e.g., '10.0.0.1').
-
-        Returns:
-            Optional[IPAddressRecord]: The IP address record, or None if not found.
-        """
+        """Return the IPAddress record for the given address."""
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
         ip_obj = IPAddress.objects.filter(host=address).first()
@@ -35,14 +29,7 @@ class NautobotORMDataSource(NautobotDataSource):
         return self._build_ip_record(ip_obj, override_address=address)
 
     def get_most_specific_prefix(self, address: str) -> Optional[PrefixRecord]:
-        """Return the most specific prefix containing the supplied address.
-
-        Args:
-            address (str): IP address to find the containing prefix for.
-
-        Returns:
-            Optional[PrefixRecord]: The most specific prefix, or None if not found.
-        """
+        """Return the most specific prefix containing the supplied address."""
         if Prefix is None:
             raise RuntimeError("Nautobot is not available in this environment")
         prefix_obj = (
@@ -60,15 +47,7 @@ class NautobotORMDataSource(NautobotDataSource):
         )
 
     def find_gateway_ip(self, prefix: PrefixRecord, custom_field: str) -> Optional[IPAddressRecord]:
-        """Return the gateway IP within the prefix tagged via custom_field.
-
-        Args:
-            prefix (PrefixRecord): The prefix to search for a gateway.
-            custom_field (str): The custom field name (e.g., 'network_gateway').
-
-        Returns:
-            Optional[IPAddressRecord]: The gateway IP record, or None if not found.
-        """
+        """Return the gateway IP within the prefix tagged via custom_field."""
         if IPAddress is None:
             raise RuntimeError("Nautobot is not available in this environment")
         prefix_obj = None
@@ -89,14 +68,7 @@ class NautobotORMDataSource(NautobotDataSource):
         return self._build_ip_record(ip_obj)
 
     def get_device(self, name: str) -> Optional[DeviceRecord]:
-        """Return the Device record for the given name.
-
-        Args:
-            name (str): The device name to look up.
-
-        Returns:
-            Optional[DeviceRecord]: The device record, or None if not found.
-        """
+        """Return the Device record for the given name."""
         if Device is None:
             raise RuntimeError("Nautobot is not available in this environment")
         device_obj = Device.objects.filter(**{"name": name}).select_related("primary_ip4", "platform").first()
@@ -127,21 +99,19 @@ class NautobotORMDataSource(NautobotDataSource):
             napalm_driver=napalm_driver,
         )
 
+    def get_interface(self, device_name: str, interface_name: str) -> Optional[Any]:
+        """Return the Interface record for the given device and interface name."""
+        if Interface is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+        interface_obj = Interface.objects.filter(device__name=device_name, name=interface_name).first()
+        return interface_obj
+
     def _build_ip_record(self, ip_obj: Any, override_address: Optional[str] = None) -> IPAddressRecord:
-        """Build an IPAddressRecord from ORM data.
-
-        Args:
-            ip_obj: The IPAddress model instance.
-            override_address (Optional[str]): Optional address to override the model’s host.
-
-        Returns:
-            IPAddressRecord: The constructed IP address record.
-        """
+        """Build an IPAddressRecord from ORM data."""
         address = override_address or str(ip_obj.host)
         prefix_length = int(ip_obj.mask_length)
         device_name = None
         interface_name = None
-        # Access the first related interface (if any)
         interface = None
         if hasattr(ip_obj, "assigned_object") and ip_obj.assigned_object is not None:
             interface = ip_obj.assigned_object

@@ -115,6 +115,20 @@ class NautobotAPIDataSource(NautobotDataSource):
             napalm_driver=napalm_driver,
         )
 
+    def get_interface(self, device_name: str, interface_name: str) -> Optional[Dict[str, Any]]:
+        """Return the Interface record for the given device and interface name."""
+        params = {"device": device_name, "name": interface_name, "limit": 1}
+        payload = self._session.get_json("/api/dcim/interfaces/", params=params)
+        results = payload.get("results", [])
+        if not results:
+            return None
+        interface = results[0]
+        return {
+            "name": interface.get("name") or interface.get("display"),
+            "device_name": self._extract_name_from_relationship(interface.get("device")),
+            "custom_field_data": interface.get("custom_field_data", {})
+        }
+
     def _ensure_prefix_id(self, prefix: PrefixRecord) -> str:
         """Resolve the prefix ID or fall back to prefix string."""
         if prefix.id:

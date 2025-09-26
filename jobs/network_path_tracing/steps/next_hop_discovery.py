@@ -32,6 +32,7 @@ class NextHopDiscoveryStep:
     """Discover the next-hop(s) from the current device to the destination."""
 
     _NXOS_DRIVERS = {"nxos", "nxos_ssh"}
+    _PALO_ALTO_INDICATORS = ["panos", "pan-os", "paloalto", "palo-alto", "panorama"]
 
     def __init__(
         self,
@@ -43,6 +44,22 @@ class NextHopDiscoveryStep:
         self._settings = settings
         self._logger = logger
         self._cache: Dict[Tuple[str, str], NextHopDiscoveryResult | str] = {}
+
+    def is_palo_alto(self, device: DeviceRecord) -> bool:
+        """Detect if the device is Palo Alto based on platform details."""
+        slug_lower = (device.platform_slug or "").lower()
+        name_lower = (device.platform_name or "").lower()
+        driver_lower = (device.napalm_driver or "").lower()
+
+        for indicator in self._PALO_ALTO_INDICATORS:
+            if indicator in slug_lower or indicator in name_lower or indicator in driver_lower:
+                if self._logger:
+                    self._logger.info(
+                        f"Detected Palo Alto device '{device.name}' based on platform indicator '{indicator}'",
+                        extra={"grouping": "next-hop-discovery"},
+                    )
+                return True
+        return False
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> NextHopDiscoveryResult:
         """Execute the next-hop discovery for the destination IP."""
@@ -64,7 +81,7 @@ class NextHopDiscoveryStep:
                 return cached
             raise NextHopDiscoveryError(cached)
 
-        if device.platform_slug == "panos":
+        if self.is_palo_alto(device):
             try:
                 result = self._run_palo_alto_lookup(device, ingress_if, validation.destination_ip)
             except NextHopDiscoveryError as exc:
@@ -86,18 +103,51 @@ class NextHopDiscoveryStep:
         pa_settings = self._settings.pa_settings()
         if not pa_settings:
             raise NextHopDiscoveryError("Palo Alto credentials not configured (set PA_USERNAME and PA_PASSWORD)")
-        client = PaloAltoClient(host=device.primary_ip, verify_ssl=pa_settings.verify_ssl, timeout=10)
+        client = PaloAltoClient(host=device.primary_ip, verify_ssl=pa_settings.verify_ssl, timeout=10, logger=self._logger)
         try:
             api_key = client.keygen(pa_settings.username, pa_settings.password)
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Authentication failed for '{device.primary_ip}': {exc}") from exc
-        vr = client.get_virtual_router_for_interface(api_key, ingress_if)
+
+        # Try Nautobot custom field first
+        vr = None
+        interface_record = self._data_source.get_interface(device.name, ingress_if)
+        if interface_record and hasattr(interface_record, 'custom_field_data') and 'virtual_router' in interface_record.custom_field_data:
+            vr = interface_record.custom_field_data['virtual_router']
+            if self._logger:
+                self._logger.info(
+                    f"Using VR '{vr}' from Nautobot custom field for interface '{ingress_if}' on '{device.name}'",
+                    extra={"grouping": "next-hop-discovery"}
+                )
+
+        # Fallback to API lookup if no VR from Nautobot
         if not vr:
-            raise NextHopDiscoveryError(f"No virtual-router found for interface '{ingress_if}' on '{device.name}'")
+            vr = client.get_virtual_router_for_interface(api_key, ingress_if)
+            if self._logger:
+                self._logger.info(
+                    f"Resolved VR '{vr}' for interface '{ingress_if}' via API (or defaulted to 'default')",
+                    extra={"grouping": "next-hop-discovery"}
+                )
+
+        # If still no VR (though client defaults to 'default'), log and proceed
+        if not vr:
+            vr = "default"
+            if self._logger:
+                self._logger.warning(
+                    f"No VR resolved; forcing fallback to 'default' for interface '{ingress_if}' on '{device.name}'",
+                    extra={"grouping": "next-hop-discovery"}
+                )
+
         try:
             res = client.fib_lookup(api_key, vr, destination_ip)
             if not (res["next_hop"] or res["egress_interface"]):
                 res = client.route_lookup(api_key, vr, destination_ip)
+            if res["next_hop"] is None and res["egress_interface"]:
+                if self._logger:
+                    self._logger.info(
+                        f"Null next-hop but egress '{res['egress_interface']}' found; may indicate direct interface route or null route",
+                        extra={"grouping": "next-hop-discovery"}
+                    )
             return NextHopDiscoveryResult(
                 found=bool(res["next_hop"] or res["egress_interface"]),
                 next_hops=[{"next_hop_ip": res["next_hop"], "egress_interface": res["egress_interface"]}],
