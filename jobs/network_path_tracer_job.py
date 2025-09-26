@@ -145,12 +145,13 @@ class NetworkPathTracerJob(Job):
                 },
                 "paths": [
                     {
+                        "path": index,
                         "hops": [
                             {
                                 "device_name": hop.device_name,
-                                "interface_name": hop.interface_name,
-                                "next_hop_ip": hop.next_hop_ip,
+                                "ingress_interface": hop.interface_name,
                                 "egress_interface": hop.egress_interface,
+                                "next_hop_ip": hop.next_hop_ip,
                                 "details": hop.details,
                             }
                             for hop in path.hops
@@ -158,7 +159,7 @@ class NetworkPathTracerJob(Job):
                         "reached_destination": path.reached_destination,
                         "issues": path.issues,
                     }
-                    for path in path_result.paths
+                    for index, path in enumerate(path_result.paths, start=1)
                 ],
                 "issues": path_result.issues,
             }

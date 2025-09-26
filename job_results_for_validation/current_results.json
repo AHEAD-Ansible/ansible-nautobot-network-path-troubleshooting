@@ -1,0 +1,78 @@
+{
+    "gateway": {
+        "address": "10.100.100.1",
+        "details": "Gateway tagged via custom field 'network_gateway'.",
+        "device_name": "Catalyst-1",
+        "found": true,
+        "interface_name": "Vlan100",
+        "method": "custom_field"
+    },
+    "issues": [],
+    "paths": [
+        {
+            "hops": [
+                {
+                    "details": "Resolved via NAPALM on 'Catalyst-1'",
+                    "device_name": "Catalyst-1",
+                    "egress_interface": "GigabitEthernet1/0/4",
+                    "ingress_interface": "Vlan100",
+                    "next_hop_ip": "172.4.4.2"
+                },
+                {
+                    "details": "Resolved via NX-OS CLI on 'NXOS-1'",
+                    "device_name": "NXOS-1",
+                    "egress_interface": "Vlan200",
+                    "ingress_interface": "Ethernet1/4",
+                    "next_hop_ip": "10.200.200.1"
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-2",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.200.200.200"
+                }
+            ],
+            "issues": [],
+            "path": 1,
+            "reached_destination": true
+        },
+        {
+            "hops": [
+                {
+                    "details": "Resolved via NAPALM on 'Catalyst-1'",
+                    "device_name": "Catalyst-1",
+                    "egress_interface": "GigabitEthernet1/0/3",
+                    "ingress_interface": "Vlan100",
+                    "next_hop_ip": "172.3.3.2"
+                },
+                {
+                    "details": "Resolved via NX-OS CLI on 'NXOS-1'",
+                    "device_name": "NXOS-1",
+                    "egress_interface": "Vlan200",
+                    "ingress_interface": "Ethernet1/3",
+                    "next_hop_ip": "10.200.200.1"
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-2",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.200.200.200"
+                }
+            ],
+            "issues": [],
+            "path": 2,
+            "reached_destination": true
+        }
+    ],
+    "source": {
+        "address": "10.100.100.100",
+        "device_name": "Server-1",
+        "interface_name": "eth1",
+        "is_host_ip": false,
+        "prefix": "10.100.100.0/24",
+        "prefix_length": 24
+    },
+    "status": "success"
+}

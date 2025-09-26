@@ -9,6 +9,7 @@ from .interfaces.palo_alto import PaloAltoClient
 from .steps.gateway_discovery import GatewayDiscoveryResult, GatewayDiscoveryStep
 from .steps.input_validation import InputValidationResult, InputValidationStep
 from .steps.next_hop_discovery import NextHopDiscoveryResult, NextHopDiscoveryStep
+from .graph import NetworkPathGraph, build_pyvis_network
 from .steps.path_tracing import PathHop, Path, PathTracingResult, PathTracingStep
 
 
@@ -38,4 +39,6 @@ __all__ = [
     "Path",
     "PathTracingResult",
     "PathTracingStep",
+    "NetworkPathGraph",
+    "build_pyvis_network",
 ]
