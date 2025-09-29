@@ -51,7 +51,7 @@ class TraceState:
     path_hops: List[PathHop] = field(default_factory=list)
     path_issues: List[str] = field(default_factory=list)
     failed_hops: int = 0
-    visited_devices: Set[str] = field(default_factory=set)
+    visited: Set[Tuple[str, str]] = field(default_factory=set)  # Changed to track (device, interface) for intra-device handling
 
 
 class PathTracingStep:
@@ -106,7 +106,7 @@ class PathTracingStep:
                     path_hops=[],
                     path_issues=[],
                     failed_hops=0,
-                    visited_devices=set(),
+                    visited=set(),
                 )
             ]
         )
@@ -167,11 +167,12 @@ class PathTracingStep:
             self._finalize_path(current_hops, path_issues, reached=False)
             return
 
-        if device_name in state.visited_devices:
+        visited_key = (device_name, interface_name or "")
+        if visited_key in state.visited:
             self._record_issue(
                 path_issues,
                 aggregate_issues,
-                f"Routing loop detected at device '{device_name}'.",
+                f"Routing loop detected at device '{device_name}' interface '{interface_name}'.",
             )
             self._finalize_path(current_hops, path_issues, reached=False)
             return
@@ -185,8 +186,39 @@ class PathTracingStep:
             self._finalize_path(current_hops, path_issues, reached=False)
             return
 
-        visited_devices = set(state.visited_devices)
-        visited_devices.add(device_name)
+        visited = set(state.visited)
+        visited.add(visited_key)
+
+        # Check if current device is the destination
+        dest_record = self._data_source.get_ip_address(destination_ip)
+        if dest_record and dest_record.device_name == device_name:
+            hop_entry = PathHop(
+                device_name=device_name,
+                interface_name=interface_name,
+                next_hop_ip=destination_ip,
+                egress_interface=dest_record.interface_name,
+                details="Reached destination on current device (local route)."
+            )
+            path_hops = current_hops + [hop_entry]
+            self._finalize_path(path_hops, path_issues, reached=True)
+
+            dest_node_id = self._node_id_for_destination(device_name, destination_ip)
+            graph.mark_destination(
+                graph.ensure_node(
+                    dest_node_id,
+                    label=device_name or destination_ip,
+                    device_name=device_name,
+                    ip_address=destination_ip,
+                )
+            )
+            node_id = self._node_id_for_device(device_name)
+            graph.add_edge(
+                node_id,
+                dest_node_id,
+                local_route=True,
+                details=hop_entry.details,
+            )
+            return
 
         node_id = self._node_id_for_device(device_name)
         label = device_name or node_id
@@ -236,6 +268,49 @@ class PathTracingStep:
         for next_hop in next_hop_result.next_hops:
             next_hop_ip = next_hop.get("next_hop_ip")
             egress_interface = next_hop.get("egress_interface")
+
+            # Handle local route if next_hop_ip is None or indicator of local
+            if next_hop_ip in (None, '', 'local', '0.0.0.0'):
+                if dest_record and dest_record.device_name == device_name:
+                    hop_entry = PathHop(
+                        device_name=device_name,
+                        interface_name=interface_name,
+                        next_hop_ip=destination_ip,
+                        egress_interface=egress_interface,
+                        details="Local route to destination."
+                    )
+                    path_hops = current_hops + [hop_entry]
+                    self._finalize_path(path_hops, path_issues, reached=True)
+
+                    dest_node_id = self._node_id_for_destination(device_name, destination_ip)
+                    graph.mark_destination(
+                        graph.ensure_node(
+                            dest_node_id,
+                            label=device_name or destination_ip,
+                            device_name=device_name,
+                            ip_address=destination_ip,
+                        )
+                    )
+                    graph.add_edge(
+                        node_id,
+                        dest_node_id,
+                        local_route=True,
+                        details=hop_entry.details,
+                    )
+                    continue
+                else:
+                    # Not local, treat as failure
+                    hop = PathHop(
+                        device_name=device_name,
+                        interface_name=interface_name,
+                        next_hop_ip=None,
+                        egress_interface=egress_interface,
+                        details="No next hop; possible blackhole."
+                    )
+                    current_hops.append(hop)
+                    self._record_issue(path_issues, aggregate_issues, "Routing blackhole detected.")
+                    self._finalize_path(current_hops, path_issues, reached=False)
+                    continue
 
             next_hop_record = self._data_source.get_ip_address(next_hop_ip) if next_hop_ip else None
 
@@ -333,7 +408,7 @@ class PathTracingStep:
                 path_hops=current_hops + [hop_entry],
                 path_issues=list(path_issues),
                 failed_hops=updated_failed_hops,
-                visited_devices=visited_devices,
+                visited=visited,
             )
             queue.append(queue_state)
 

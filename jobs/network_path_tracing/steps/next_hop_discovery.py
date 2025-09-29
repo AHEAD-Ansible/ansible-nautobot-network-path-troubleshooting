@@ -1,15 +1,15 @@
-"""Step 3: next-hop discovery on the current device."""
+"""Step 3: Next-hop discovery on the current device."""
 
 from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
-from ..interfaces.nautobot import NautobotDataSource, DeviceRecord
+from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
 from ..interfaces.palo_alto import PaloAltoClient
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
@@ -29,9 +29,14 @@ class NextHopDiscoveryResult:
 
 
 class NextHopDiscoveryStep:
-    """Discover the next-hop(s) from the current device to the destination."""
+    """Discover the next-hop(s) from the current device to the destination.
+
+    Handles Palo Alto devices via their API and other platforms via NAPALM.
+    Ensures robust platform detection to avoid incorrect driver usage.
+    """
 
     _NXOS_DRIVERS = {"nxos", "nxos_ssh"}
+    _PALO_ALTO_INDICATORS = {"palo", "panos", "palo_alto"}
 
     def __init__(
         self,
@@ -45,9 +50,21 @@ class NextHopDiscoveryStep:
         self._cache: Dict[Tuple[str, str], NextHopDiscoveryResult | str] = {}
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> NextHopDiscoveryResult:
-        """Execute the next-hop discovery for the destination IP."""
+        """Execute next-hop discovery for the destination IP.
+
+        Args:
+            validation: Input validation result containing source/destination IPs.
+            gateway: Gateway discovery result with device and interface details.
+
+        Returns:
+            NextHopDiscoveryResult: Result containing next-hop details or errors.
+
+        Raises:
+            NextHopDiscoveryError: If device, IP, or interface is missing, or lookup fails.
+        """
         if not gateway.found or not gateway.gateway or not gateway.gateway.device_name:
             raise NextHopDiscoveryError("No gateway device available for next-hop lookup")
+
         device = self._data_source.get_device(gateway.gateway.device_name)
         if not device:
             raise NextHopDiscoveryError(f"Device '{gateway.gateway.device_name}' not found in Nautobot")
@@ -64,60 +81,113 @@ class NextHopDiscoveryStep:
                 return cached
             raise NextHopDiscoveryError(cached)
 
-        if device.platform_slug == "panos":
+        # Check if device is Palo Alto based on platform_slug or platform_name
+        platform_slug_lower = (device.platform_slug or "").lower()
+        platform_name_lower = (device.platform_name or "").lower()
+        is_palo_alto = any(
+            indicator in platform_slug_lower or indicator in platform_name_lower
+            for indicator in self._PALO_ALTO_INDICATORS
+        )
+
+        if is_palo_alto:
+            if self._logger:
+                self._logger.info(
+                    f"Detected Palo Alto device '{device.name}' (platform: {device.platform_slug or device.platform_name})",
+                    extra={"grouping": "next-hop-discovery"},
+                )
             try:
                 result = self._run_palo_alto_lookup(device, ingress_if, validation.destination_ip)
+                self._cache[cache_key] = result
+                return result
             except NextHopDiscoveryError as exc:
                 self._cache[cache_key] = str(exc)
                 raise
-            self._cache[cache_key] = result
-            return result
-
-        try:
-            result = self._run_napalm_lookup(device, ingress_if, validation.destination_ip)
-        except NextHopDiscoveryError as exc:
-            self._cache[cache_key] = str(exc)
-            raise
-        self._cache[cache_key] = result
-        return result
+        else:
+            if self._logger:
+                self._logger.info(
+                    f"Using NAPALM for device '{device.name}' (platform: {device.platform_slug or device.platform_name})",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+            try:
+                result = self._run_napalm_lookup(device, ingress_if, validation.destination_ip)
+                self._cache[cache_key] = result
+                return result
+            except NextHopDiscoveryError as exc:
+                self._cache[cache_key] = str(exc)
+                raise
 
     def _run_palo_alto_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
-        """Perform next-hop lookup for Palo Alto devices."""
+        """Perform next-hop lookup for Palo Alto devices using their API.
+
+        Args:
+            device: Device record from Nautobot.
+            ingress_if: Ingress interface name (e.g., 'ethernet1/12').
+            destination_ip: Destination IP to look up.
+
+        Returns:
+            NextHopDiscoveryResult: Result with next-hop and egress interface.
+
+        Raises:
+            NextHopDiscoveryError: If credentials, virtual router, or lookup fails.
+        """
         pa_settings = self._settings.pa_settings()
         if not pa_settings:
             raise NextHopDiscoveryError("Palo Alto credentials not configured (set PA_USERNAME and PA_PASSWORD)")
-        client = PaloAltoClient(host=device.primary_ip, verify_ssl=pa_settings.verify_ssl, timeout=10)
+
+        client = PaloAltoClient(
+            host=device.primary_ip,
+            verify_ssl=pa_settings.verify_ssl,
+            timeout=10,
+            logger=self._logger,
+        )
+
         try:
             api_key = client.keygen(pa_settings.username, pa_settings.password)
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Authentication failed for '{device.primary_ip}': {exc}") from exc
+
         vr = client.get_virtual_router_for_interface(api_key, ingress_if)
         if not vr:
             raise NextHopDiscoveryError(f"No virtual-router found for interface '{ingress_if}' on '{device.name}'")
+
         try:
+            # Try FIB lookup first, fall back to route lookup
             res = client.fib_lookup(api_key, vr, destination_ip)
             if not (res["next_hop"] or res["egress_interface"]):
                 res = client.route_lookup(api_key, vr, destination_ip)
+
             return NextHopDiscoveryResult(
                 found=bool(res["next_hop"] or res["egress_interface"]),
                 next_hops=[{"next_hop_ip": res["next_hop"], "egress_interface": res["egress_interface"]}],
-                details=f"Resolved using virtual-router '{vr}' on '{device.name}'"
+                details=f"Resolved using virtual-router '{vr}' on '{device.name}'",
             )
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Next-hop lookup failed for '{destination_ip}': {exc}") from exc
 
     def _run_napalm_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
-        """Perform next-hop lookup using NAPALM."""
+        """Perform next-hop lookup using NAPALM for non-Palo Alto devices.
 
+        Args:
+            device: Device record from Nautobot.
+            ingress_if: Ingress interface name.
+            destination_ip: Destination IP to look up.
+
+        Returns:
+            NextHopDiscoveryResult: Result with next-hop and egress interface.
+
+        Raises:
+            NextHopDiscoveryError: If NAPALM is unavailable, credentials are missing, or lookup fails.
+        """
         if napalm is None:
             raise NextHopDiscoveryError("NAPALM is not installed; cannot perform lookup for non-Palo Alto device")
+
         napalm_settings = self._settings.napalm_settings()
         if not napalm_settings:
             raise NextHopDiscoveryError("NAPALM credentials not configured (set NAPALM_USERNAME and NAPALM_PASSWORD)")
 
         driver_name = self._select_napalm_driver(device)
-
         last_error: Optional[Exception] = None
+
         for candidate in self._driver_attempts(driver_name):
             try:
                 driver = napalm.get_network_driver(candidate)
@@ -153,7 +223,7 @@ class NextHopDiscoveryStep:
                         next_hops=next_hops,
                         details=details,
                     )
-            except Exception as exc:  # noqa: BLE001 - escalate after fallbacks
+            except Exception as exc:
                 last_error = exc
                 if self._logger:
                     self._logger.warning(
@@ -162,13 +232,17 @@ class NextHopDiscoveryStep:
                     )
                 continue
 
-        raise NextHopDiscoveryError(
-            f"NAPALM lookup failed for '{device.name}': {last_error}"
-        )
+        raise NextHopDiscoveryError(f"NAPALM lookup failed for '{device.name}': {last_error}")
 
     def _driver_attempts(self, initial: str) -> List[str]:
-        """Order the driver names to try, adding sensible fallbacks."""
+        """Order the NAPALM driver names to try, with fallbacks.
 
+        Args:
+            initial: Initial driver name to try.
+
+        Returns:
+            List of driver names to attempt.
+        """
         attempts = [initial]
         if initial == "nxos":
             attempts.append("nxos_ssh")
@@ -178,8 +252,14 @@ class NextHopDiscoveryStep:
 
     @staticmethod
     def _optional_args_for(driver_name: str) -> dict:
-        """Return driver-specific optional arguments."""
+        """Return driver-specific optional arguments for NAPALM.
 
+        Args:
+            driver_name: Name of the NAPALM driver.
+
+        Returns:
+            Dictionary of optional arguments.
+        """
         if driver_name == "nxos":
             return {"port": 443, "verify": False}
         if driver_name == "nxos_ssh":
@@ -189,8 +269,14 @@ class NextHopDiscoveryStep:
         return {}
 
     def _select_napalm_driver(self, device: DeviceRecord) -> str:
-        """Determine the appropriate NAPALM driver name for a device."""
+        """Determine the appropriate NAPALM driver name for a device.
 
+        Args:
+            device: Device record from Nautobot.
+
+        Returns:
+            NAPALM driver name (defaults to 'ios' if unknown).
+        """
         driver_map = {
             "ios": "ios",
             "cisco_ios": "ios",
@@ -216,12 +302,20 @@ class NextHopDiscoveryStep:
 
     @staticmethod
     def _collect_generic_routes(device_conn, destination_ip: str) -> List[dict]:
-        """Collect next-hop information using get_route_to()."""
+        """Collect next-hop information using NAPALM's get_route_to().
 
+        Args:
+            device_conn: NAPALM device connection.
+            destination_ip: Destination IP to look up.
+
+        Returns:
+            List of dictionaries with next-hop and egress interface details.
+        """
         try:
             route_table = device_conn.get_route_to(destination=destination_ip)
         except Exception as exc:
             raise NextHopDiscoveryError(f"get_route_to failed: {exc}") from exc
+
         next_hops: List[dict] = []
         for routes in route_table.values():
             entries: List[dict] = []
@@ -248,8 +342,16 @@ class NextHopDiscoveryStep:
         return next_hops
 
     def _collect_nxos_routes(self, device_conn, destination_ip: str, ingress_if: str) -> List[dict]:
-        """Collect next-hop information for NX-OS platforms via CLI JSON."""
+        """Collect next-hop information for NX-OS platforms via CLI JSON.
 
+        Args:
+            device_conn: NAPALM device connection.
+            destination_ip: Destination IP to look up.
+            ingress_if: Ingress interface name.
+
+        Returns:
+            List of dictionaries with next-hop and egress interface details.
+        """
         vrf_candidates: List[Optional[str]] = []
         interface_vrf = self._detect_nxos_interface_vrf(device_conn, ingress_if)
         if interface_vrf:
@@ -278,11 +380,18 @@ class NextHopDiscoveryStep:
         return self._collect_generic_routes(device_conn, destination_ip)
 
     def _run_nxos_cli(self, device_conn, command: str) -> Optional[dict]:
-        """Run an NX-OS CLI command and return parsed JSON data."""
+        """Run an NX-OS CLI command and return parsed JSON data.
 
+        Args:
+            device_conn: NAPALM device connection.
+            command: CLI command to execute.
+
+        Returns:
+            Parsed JSON data or None if the command fails.
+        """
         try:
             response = device_conn.cli([command])
-        except Exception as exc:  # pragma: no cover - transport errors fallback to generic handler
+        except Exception as exc:
             if self._logger:
                 self._logger.info(
                     f"NX-OS CLI lookup failed for '{command}': {exc}",
@@ -314,8 +423,14 @@ class NextHopDiscoveryStep:
             return None
 
     def _parse_nxos_route_payload(self, data: dict) -> List[dict]:
-        """Translate NX-OS JSON route payload into generic next-hop entries."""
+        """Translate NX-OS JSON route payload into generic next-hop entries.
 
+        Args:
+            data: Parsed JSON data from NX-OS CLI.
+
+        Returns:
+            List of dictionaries with next-hop and egress interface details.
+        """
         def as_list(value):
             if isinstance(value, list):
                 return value
@@ -393,15 +508,20 @@ class NextHopDiscoveryStep:
         return next_hops
 
     def _fetch_nxos_vrfs(self, device_conn) -> List[str]:
-        """Return a list of VRF names configured on the NX-OS device."""
+        """Return a list of VRF names configured on the NX-OS device.
 
+        Args:
+            device_conn: NAPALM device connection.
+
+        Returns:
+            List of VRF names, excluding 'management'.
+        """
         command = "show vrf | json"
         data = self._run_nxos_cli(device_conn, command)
         if not data:
             return []
 
         vrfs = []
-
         def as_list(value):
             if isinstance(value, list):
                 return value
@@ -417,8 +537,15 @@ class NextHopDiscoveryStep:
         return vrfs
 
     def _detect_nxos_interface_vrf(self, device_conn, interface: str) -> Optional[str]:
-        """Return the VRF name associated with an interface, if any."""
+        """Return the VRF name associated with an interface, if any.
 
+        Args:
+            device_conn: NAPALM device connection.
+            interface: Interface name to check.
+
+        Returns:
+            VRF name or None if not found or interface is empty.
+        """
         if not interface:
             return None
 
@@ -428,7 +555,6 @@ class NextHopDiscoveryStep:
             return None
 
         table = data.get("TABLE_intf", {})
-
         def as_list(value):
             if isinstance(value, list):
                 return value

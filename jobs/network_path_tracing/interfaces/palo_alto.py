@@ -46,11 +46,12 @@ def _extract_next_hop_bundle(root: ET.Element) -> Dict[str, Optional[str]]:
 
 class PaloAltoClient:
     """Client for interacting with Palo Alto devices via API."""
-    def __init__(self, host: str, verify_ssl: bool, timeout: int = 10):
+    def __init__(self, host: str, verify_ssl: bool, timeout: int = 10, logger: Optional[logging.Logger] = None):
         self.host = host
         self.session = requests.Session()
         self.session.verify = verify_ssl
         self.timeout = timeout
+        self.logger = logger
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -72,18 +73,33 @@ class PaloAltoClient:
             raise RuntimeError("API key not found in response.")
         return key
 
-    def get_virtual_router_for_interface(self, api_key: str, interface: str) -> Optional[str]:
-        """Get the virtual router for a given interface."""
-        xpath = "/config/devices/entry[@name='localhost.localdomain']/network/virtual-router"
+    def get_virtual_router_for_interface(self, api_key: str, interface: str) -> str:
+        """Get the virtual router for a given interface, defaulting to 'default'."""
+        xpath = "//virtual-router"
         url = f"https://{self.host}/api/?type=config&action=get&xpath={urllib.parse.quote(xpath)}&key={api_key}"
         r = self._get(url)
         root = _parse_pan_xml(r.text)
+        if self.logger:
+            self.logger.debug(
+                f"VR XML response for interface '{interface}': {ET.tostring(root, encoding='unicode')}",
+                extra={"grouping": "next-hop-discovery"}
+            )
         for vr in root.findall(".//virtual-router/entry"):
             vr_name = vr.get("name")
-            members = [m.text.strip() for m in vr.findall(".//interface/member") if m.text]
+            members = [m.text.strip() for m in vr.findall(".//interface/member") if m.text and m.text.strip()]
             if interface in members:
+                if self.logger:
+                    self.logger.info(
+                        f"Found VR '{vr_name}' for interface '{interface}'",
+                        extra={"grouping": "next-hop-discovery"}
+                    )
                 return vr_name
-        return None
+        if self.logger:
+            self.logger.warning(
+                f"No VR found for interface '{interface}'; defaulting to 'default' virtual router",
+                extra={"grouping": "next-hop-discovery"}
+            )
+        return "default"
 
     def op(self, api_key: str, cmd_xml: str) -> ET.Element:
         """Execute an operational command."""

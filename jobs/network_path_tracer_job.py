@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import ipaddress
 from typing import Optional
 
 from nautobot.apps.jobs import IPAddressVar, Job
-from nautobot.extras.models import CustomField
-from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
-from django.core.exceptions import ObjectDoesNotExist, FieldError
+from nautobot.extras.choices import JobResultStatusChoices
 
-from network_path_tracing import (
+from network_path_tracing import (  # Changed to absolute import
     GatewayDiscoveryError,
     GatewayDiscoveryStep,
     InputValidationError,
@@ -22,12 +19,17 @@ from network_path_tracing import (
     NextHopDiscoveryStep,
     PathTracingError,
     PathTracingStep,
+    build_pyvis_network,
 )
-from nautobot.apps.jobs import register_jobs
 
-@register_jobs
+
 class NetworkPathTracerJob(Job):
-    """Trace the network path between source and destination IPs."""
+    """Trace the network path between source and destination IPs.
+
+    This Job follows Nautobot best practices: read-only, no sensitive variables,
+    modular steps for validation/gateway/path tracing, robust error handling,
+    and result visualization.
+    """
 
     class Meta:
         name = "Network Path Tracer"
@@ -36,14 +38,17 @@ class NetworkPathTracerJob(Job):
             "including gateway discovery, next-hop lookups, and ECMP handling."
         )
         has_sensitive_variables = False
-        read_only = False
+        read_only = True
+        dryrun_default = False  # Explicit for clarity, though read_only
+        field_order = ["source_ip", "destination_ip"]  # UI form order
+        # soft_time_limit / time_limit could be added if long-running
 
     source_ip = IPAddressVar(
-        description="Source IP Address (e.g., server IP)",
+        description="Source IP Address (e.g., 10.0.0.1)",
         required=True,
     )
     destination_ip = IPAddressVar(
-        description="Destination IP Address",
+        description="Destination IP Address (e.g., 4.2.2.1)",
         required=True,
     )
 
@@ -51,8 +56,8 @@ class NetworkPathTracerJob(Job):
         """Execute the full network path tracing workflow.
 
         Args:
-            source_ip (str): Source IP address (e.g., '10.0.0.1/24').
-            destination_ip (str): Destination IP address (e.g., '4.2.2.1/24').
+            source_ip (str): Source IP address (e.g., '10.0.0.1').
+            destination_ip (str): Destination IP address (e.g., '4.2.2.1').
             **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
 
         Returns:
@@ -64,67 +69,70 @@ class NetworkPathTracerJob(Job):
             GatewayDiscoveryError: If gateway discovery fails.
             NextHopDiscoveryError: If next-hop discovery fails.
             PathTracingError: If path tracing fails.
+
+        Best practices: Use self.log_* for traceability. Set JobResult status/data.
+        Raise exceptions for failures (Nautobot captures tracebacks in JobResult).
         """
         # Log job start
-        self.logger.info(
-            f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}",
-            extra={"grouping": "job-start", "object": self.job_result}
-        )
-        self.job_result.log("Job has started.", level_choice=LogLevelChoices.LOG_INFO)
-        self.job_result.save()
+        self.log_info(message=f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}")
 
-        # Log unexpected kwargs
+        # Log unexpected kwargs (robustness)
         if kwargs:
-            self.logger.warning(
-                f"Unexpected keyword arguments received: {kwargs}",
-                extra={"grouping": "job-start"}
-            )
+            self.log_warning(message=f"Unexpected keyword arguments received: {kwargs}")
 
-        # Validate IP addresses
+        # Validate IP addresses (IPAddressVar returns str, but we normalize)
         try:
             ipaddress.ip_address(self._to_address_string(source_ip))
             ipaddress.ip_address(self._to_address_string(destination_ip))
         except ValueError as exc:
-            self._fail_job(f"Invalid IP address: {exc}", grouping="input-validation")
-            raise ValueError(f"Invalid IP address: {exc}")
+            self._fail_job(f"Invalid IP address: {exc}")
+            return {}  # Nautobot handles return on failure
 
         # Initialize settings
         settings = NetworkPathSettings(
             source_ip=self._to_address_string(source_ip),
             destination_ip=self._to_address_string(destination_ip),
         )
-        self.logger.info(
-            f"Normalized settings: source_ip={settings.source_ip}, destination_ip={settings.destination_ip}",
-            extra={"grouping": "settings"}
-        )
+        self.log_debug(message=f"Normalized settings: source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
 
-        # Initialize workflow steps
+        # Initialize workflow steps (modular for testability)
         data_source = NautobotORMDataSource()
         validation_step = InputValidationStep(data_source)
         gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
-        next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)
+        next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
         path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
 
         try:
             # Step 1: Validate inputs
-            self.logger.info("Starting input validation", extra={"grouping": "validation"})
+            self.log_info(message="Starting input validation")
             validation = validation_step.run(settings)
-            self.logger.success("Input validation completed successfully", extra={"grouping": "validation"})
-            self.job_result.log("Input validation completed.", level_choice=LogLevelChoices.LOG_SUCCESS)
+            self.log_success(message="Input validation completed successfully")
 
             # Step 2: Locate gateway
-            self.logger.info("Starting gateway discovery", extra={"grouping": "gateway-discovery"})
+            self.log_info(message="Starting gateway discovery")
             gateway = gateway_step.run(validation)
-            self.logger.success(f"Gateway discovery completed: {gateway.details}", extra={"grouping": "gateway-discovery"})
-            self.job_result.log(f"Gateway discovery: {gateway.details}", level_choice=LogLevelChoices.LOG_SUCCESS)
+            self.log_success(message=f"Gateway discovery completed: {gateway.details}")
 
             # Step 3: Initialize path tracing
-            self.logger.info("Starting path tracing", extra={"grouping": "path-tracing"})
+            self.log_info(message="Starting path tracing")
             path_result = path_tracing_step.run(validation, gateway)
-            self.logger.success("Path tracing completed successfully", extra={"grouping": "path-tracing"})
-            self.job_result.log("Path tracing completed.", level_choice=LogLevelChoices.LOG_SUCCESS)
+            self.log_success(message="Path tracing completed successfully")
 
-            # Prepare result payload
+            # Generate visualization if graph is available (optional dependency)
+            visualization_attached = False
+            if path_result.graph:
+                try:
+                    net = build_pyvis_network(path_result.graph)
+                    html = net.generate_html()
+                    self.create_file("network_path_trace.html", html)  # Attach to JobResult
+                    visualization_attached = True
+                    self.log_info(message="Generated interactive network path visualization and attached to job result.")
+                except ImportError as exc:
+                    self.log_warning(message=f"Visualization skipped: pyvis or networkx not installed ({exc})")
+                except Exception as exc:
+                    self.log_warning(message=f"Visualization generation failed: {exc}")
+
+            # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {
                 "status": "success",
                 "source": {
@@ -164,95 +172,43 @@ class NetworkPathTracerJob(Job):
                 "issues": path_result.issues,
             }
 
-            # Store result
-            self._store_path_result(result_payload)
+            if visualization_attached:
+                result_payload["visualization"] = "See attached 'network_path_trace.html' for interactive graph."
 
-            # Save result and mark success
+            # Store result in JobResult (best practice)
             self.job_result.data = result_payload
             self.job_result.set_status(JobResultStatusChoices.STATUS_SUCCESS)
-            self.job_result.save()
-            self.logger.success(
-                "Network path trace completed successfully",
-                extra={"grouping": "job-completion", "object": self.job_result}
-            )
-            self.job_result.log(
-                "Network path trace completed successfully.",
-                level_choice=LogLevelChoices.LOG_SUCCESS
-            )
+            self.log_success(message="Network path trace completed successfully.")
 
             return result_payload
 
-        except InputValidationError as exc:
-            self._fail_job(f"Input validation failed: {exc}", grouping="validation")
-        except GatewayDiscoveryError as exc:
-            self._fail_job(f"Gateway discovery failed: {exc}", grouping="gateway-discovery")
-        except NextHopDiscoveryError as exc:
-            self._fail_job(f"Next-hop discovery failed: {exc}", grouping="next-hop-discovery")
-        except PathTracingError as exc:
-            self._fail_job(f"Path tracing failed: {exc}", grouping="path-tracing")
+        except (InputValidationError, GatewayDiscoveryError, NextHopDiscoveryError, PathTracingError) as exc:
+            self._fail_job(f"{type(exc).__name__} failed: {exc}")
         except Exception as exc:
-            self._fail_job(f"Unexpected error: {exc}", grouping="unexpected-error")
+            self._fail_job(f"Unexpected error: {exc}")
         finally:
-            self.job_result.save()
+            self.job_result.save()  # Always save JobResult
 
-    def _fail_job(self, message: str, grouping: str) -> None:
+        return {}  # Return empty on failure (Nautobot logs the exception)
+
+    def _fail_job(self, message: str) -> None:
         """Fail the job with a given error message.
 
-        Args:
-            message (str): The error message to log.
-            grouping (str): The log grouping for structured logging.
+        Logs failure and sets status. Raises exception for Nautobot to capture traceback.
         """
-        self.logger.error(message, extra={"grouping": grouping, "object": self.job_result})
-        self.job_result.log(message, level_choice=LogLevelChoices.LOG_ERROR)
+        self.log_failure(message=message)
         self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
-        self.job_result.save()
-        raise ValueError(message)
-
-    def _store_path_result(self, payload: dict) -> None:
-        """Store the path tracing result in JobResult's custom_field_data.
-
-        Args:
-            payload (dict): The result payload to store.
-        """
-        try:
-            CustomField.objects.get(key="network_path_trace_results")
-        except CustomField.DoesNotExist:
-            self.logger.warning(
-                "Custom field 'network_path_trace_results' not found; logging result instead",
-                extra={"grouping": "result-storage", "object": self.job_result}
-            )
-            self.logger.info(
-                f"Job result:\n{json.dumps(payload, indent=2)}",
-                extra={"grouping": "result-storage", "object": self.job_result}
-            )
-            return
-        except FieldError as exc:
-            self.logger.error(
-                f"Custom field lookup failed: {exc}",
-                extra={"grouping": "result-storage", "object": self.job_result}
-            )
-            return
-
-        if hasattr(self.job_result, "cf"):
-            self.job_result.cf["network_path_trace_results"] = payload
-            save_method = getattr(self.job_result, "validated_save", None)
-            if callable(save_method):
-                save_method()
-                return
-
-        self.job_result.custom_field_data["network_path_trace_results"] = payload
-        self.job_result.save()
+        raise RuntimeError(message)  # Use RuntimeError for general failures
 
     @staticmethod
     def _to_address_string(value: str) -> str:
         """Normalize Nautobot job input to a plain string IP address.
 
+        Handles optional /prefix from user input.
         Args:
-            value: Input value (string, e.g., '10.0.0.1/24').
+            value: Input value (str, e.g., '10.0.0.1/24').
 
         Returns:
             str: Normalized IP address without prefix (e.g., '10.0.0.1').
         """
-        if isinstance(value, str):
-            return value.split("/")[0]
-        return str(value).split("/")[0]
+        return value.split("/")[0].strip()
