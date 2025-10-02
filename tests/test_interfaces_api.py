@@ -2,6 +2,11 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 import responses
+import sys
+from types import SimpleNamespace
+
+if "napalm" not in sys.modules:
+    sys.modules["napalm"] = SimpleNamespace(get_network_driver=lambda *_args, **_kwargs: None)
 
 from jobs.network_path_tracing import NautobotAPISettings
 from jobs.network_path_tracing.interfaces.nautobot import PrefixRecord

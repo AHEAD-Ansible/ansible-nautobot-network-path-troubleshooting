@@ -7,6 +7,10 @@ from typing import Optional
 
 from nautobot.apps.jobs import IPAddressVar, Job
 from nautobot.extras.choices import JobResultStatusChoices
+from nautobot.extras.models import CustomField
+from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
+from django.core.exceptions import ObjectDoesNotExist, FieldError
+from nautobot.apps.jobs import register_jobs
 
 from network_path_tracing import (  # Changed to absolute import
     GatewayDiscoveryError,
@@ -23,6 +27,7 @@ from network_path_tracing import (  # Changed to absolute import
 )
 
 
+@register_jobs
 class NetworkPathTracerJob(Job):
     """Trace the network path between source and destination IPs.
 
@@ -74,11 +79,11 @@ class NetworkPathTracerJob(Job):
         Raise exceptions for failures (Nautobot captures tracebacks in JobResult).
         """
         # Log job start
-        self.log_info(message=f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}")
+        self.logger.info(msg=f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}")
 
         # Log unexpected kwargs (robustness)
         if kwargs:
-            self.log_warning(message=f"Unexpected keyword arguments received: {kwargs}")
+            self.logger.warning(msg=f"Unexpected keyword arguments received: {kwargs}")
 
         # Validate IP addresses (IPAddressVar returns str, but we normalize)
         try:
@@ -93,7 +98,7 @@ class NetworkPathTracerJob(Job):
             source_ip=self._to_address_string(source_ip),
             destination_ip=self._to_address_string(destination_ip),
         )
-        self.log_debug(message=f"Normalized settings: source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
+        self.logger.debug(msg=f"Normalized settings: source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
 
         # Initialize workflow steps (modular for testability)
         data_source = NautobotORMDataSource()
@@ -104,19 +109,19 @@ class NetworkPathTracerJob(Job):
 
         try:
             # Step 1: Validate inputs
-            self.log_info(message="Starting input validation")
+            self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
-            self.log_success(message="Input validation completed successfully")
+            self.logger.success("Input validation completed successfully")
 
             # Step 2: Locate gateway
-            self.log_info(message="Starting gateway discovery")
+            self.logger.info(msg="Starting gateway discovery")
             gateway = gateway_step.run(validation)
-            self.log_success(message=f"Gateway discovery completed: {gateway.details}")
+            self.logger.success(f"Gateway discovery completed: {gateway.details}")
 
             # Step 3: Initialize path tracing
-            self.log_info(message="Starting path tracing")
+            self.logger.info(msg="Starting path tracing")
             path_result = path_tracing_step.run(validation, gateway)
-            self.log_success(message="Path tracing completed successfully")
+            self.logger.success("Path tracing completed successfully")
 
             # Generate visualization if graph is available (optional dependency)
             visualization_attached = False
@@ -126,11 +131,11 @@ class NetworkPathTracerJob(Job):
                     html = net.generate_html()
                     self.create_file("network_path_trace.html", html)  # Attach to JobResult
                     visualization_attached = True
-                    self.log_info(message="Generated interactive network path visualization and attached to job result.")
+                    self.logger.info(msg="Generated interactive network path visualization and attached to job result.")
                 except ImportError as exc:
-                    self.log_warning(message=f"Visualization skipped: pyvis or networkx not installed ({exc})")
+                    self.logger.warning(msg=f"Visualization skipped: pyvis or networkx not installed ({exc})")
                 except Exception as exc:
-                    self.log_warning(message=f"Visualization generation failed: {exc}")
+                    self.logger.warning(msg=f"Visualization generation failed: {exc}")
 
             # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {
@@ -178,7 +183,7 @@ class NetworkPathTracerJob(Job):
             # Store result in JobResult (best practice)
             self.job_result.data = result_payload
             self.job_result.set_status(JobResultStatusChoices.STATUS_SUCCESS)
-            self.log_success(message="Network path trace completed successfully.")
+            self.logger.success("Network path trace completed successfully.")
 
             return result_payload
 
@@ -196,7 +201,7 @@ class NetworkPathTracerJob(Job):
 
         Logs failure and sets status. Raises exception for Nautobot to capture traceback.
         """
-        self.log_failure(message=message)
+        self.logger.failure(message)
         self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
         raise RuntimeError(message)  # Use RuntimeError for general failures
 
@@ -211,4 +216,6 @@ class NetworkPathTracerJob(Job):
         Returns:
             str: Normalized IP address without prefix (e.g., '10.0.0.1').
         """
-        return value.split("/")[0].strip()
+        if isinstance(value, str):
+            return value.split("/")[0]
+        return str(value).split("/")[0]

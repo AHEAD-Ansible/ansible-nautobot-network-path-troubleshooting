@@ -11,7 +11,13 @@ if "napalm" not in sys.modules:
 
 from jobs.network_path_tracing import NetworkPathSettings, NapalmSettings
 from jobs.network_path_tracing import GatewayDiscoveryError, InputValidationError
-from jobs.network_path_tracing.interfaces.nautobot import IPAddressRecord, PrefixRecord, DeviceRecord
+from jobs.network_path_tracing.interfaces.nautobot import (
+    IPAddressRecord,
+    PrefixRecord,
+    DeviceRecord,
+    RedundancyMember,
+    RedundancyResolution,
+)
 from jobs.network_path_tracing.steps import (
     GatewayDiscoveryResult,
     GatewayDiscoveryStep,
@@ -32,11 +38,13 @@ class FakeDataSource:
         ip_records: dict[str, IPAddressRecord],
         prefix_record: PrefixRecord | None,
         gateway_record: IPAddressRecord | None = None,
+        redundancy_resolution: RedundancyResolution | None = None,
     ) -> None:
         self._ip_records = ip_records
         self._prefix_record = prefix_record
         self._gateway_record = gateway_record
         self.last_gateway_lookup = None
+        self._redundancy_resolution = redundancy_resolution
 
     def get_ip_address(self, address: str) -> IPAddressRecord | None:
         return self._ip_records.get(address)
@@ -49,6 +57,21 @@ class FakeDataSource:
     ) -> IPAddressRecord | None:  # noqa: ARG002
         self.last_gateway_lookup = prefix
         return self._gateway_record
+
+    def get_device(self, name: str):  # pragma: no cover - not used in these tests
+        for record in self._ip_records.values():
+            if record.device_name == name:
+                return DeviceRecord(name=name)
+        return None
+
+    def get_interface_ip(self, device_name: str, interface_name: str) -> IPAddressRecord | None:
+        for record in self._ip_records.values():
+            if record.device_name == device_name and record.interface_name == interface_name:
+                return record
+        return None
+
+    def resolve_redundant_gateway(self, address: str):  # noqa: D401
+        return self._redundancy_resolution
 
 
 @pytest.fixture
@@ -143,6 +166,55 @@ def test_gateway_custom_field(prefix_record, source_ip_record):
     assert result.method == "custom_field"
     assert result.gateway == gateway_record
     assert "network_gateway" in (result.details or "")
+
+
+def test_gateway_custom_field_hsrp_fallback(prefix_record, source_ip_record):
+    base_gateway_record = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=None,
+        interface_name=None,
+    )
+    redundant_gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="hsrp-device",
+        interface_name="Gig0/2",
+    )
+    resolution = RedundancyResolution(
+        preferred=redundant_gateway,
+        members=(
+            RedundancyMember(
+                device_name="hsrp-device",
+                interface_name="Gig0/2",
+                priority=110,
+                is_preferred=True,
+            ),
+            RedundancyMember(
+                device_name="hsrp-backup",
+                interface_name="Gig0/3",
+                priority=90,
+                is_preferred=False,
+            ),
+        ),
+    )
+
+    data_source = FakeDataSource(
+        ip_records={},
+        prefix_record=prefix_record,
+        gateway_record=base_gateway_record,
+        redundancy_resolution=resolution,
+    )
+
+    validation = build_validation_result(prefix_record, source_ip_record, is_host=False)
+    step = GatewayDiscoveryStep(data_source, "network_gateway")
+    result = step.run(validation)
+
+    assert result.method == "hsrp"
+    assert result.gateway == redundant_gateway
+    assert "interface redundancy" in result.details.lower()
+    assert len(result.redundant_members) == 2
+    assert any(member.is_preferred for member in result.redundant_members)
 
 
 def test_gateway_fallback_to_lowest_host(prefix_record, source_ip_record):
@@ -357,6 +429,99 @@ def test_path_tracing_destination_info_missing(default_settings, path_gateway, p
     assert "not found" in path.hops[-1].details.lower()
 
 
+def test_path_tracing_local_subnet_via_interface(prefix_record, source_ip_record):
+    """Treat lack of next-hop as success when destination shares the egress subnet."""
+
+    settings = NetworkPathSettings(
+        source_ip="10.10.10.10",
+        destination_ip="10.200.200.55",
+    )
+
+    validation = InputValidationResult(
+        source_ip=settings.source_ip,
+        destination_ip=settings.destination_ip,
+        source_record=source_ip_record,
+        source_prefix=prefix_record,
+        is_host_ip=False,
+    )
+
+    gateway = GatewayDiscoveryResult(
+        found=True,
+        method="custom",
+        gateway=IPAddressRecord(
+            address="10.10.10.1",
+            prefix_length=24,
+            device_name="edge-1",
+            interface_name="Gig0/0",
+        ),
+    )
+
+    dest_record = IPAddressRecord(
+        address=settings.destination_ip,
+        prefix_length=24,
+        device_name="dest-host",
+        interface_name="eth0",
+    )
+
+    firewall_ingress = IPAddressRecord(
+        address="172.16.0.2",
+        prefix_length=30,
+        device_name="PaloAlto-1",
+        interface_name="eth1/2",
+    )
+
+    firewall_interface = IPAddressRecord(
+        address="10.200.200.1",
+        prefix_length=24,
+        device_name="PaloAlto-1",
+        interface_name="vlan.200",
+    )
+
+    data_source = PathDataSource(
+        ip_records={
+            dest_record.address: dest_record,
+            firewall_ingress.address: firewall_ingress,
+            firewall_interface.address: firewall_interface,
+        }
+    )
+
+    class PaloAltoSequencedNextHop:
+        def run(self, _validation, next_gateway):  # noqa: D401
+            device_name = next_gateway.gateway.device_name
+            if device_name == "edge-1":
+                return NextHopDiscoveryResult(
+                    found=True,
+                    next_hops=[
+                        {
+                            "next_hop_ip": firewall_ingress.address,
+                            "egress_interface": "Gig0/1",
+                        }
+                    ],
+                    details="toward firewall",
+                )
+            return NextHopDiscoveryResult(
+                found=True,
+                next_hops=[
+                    {
+                        "next_hop_ip": None,
+                        "egress_interface": firewall_interface.interface_name,
+                    }
+                ],
+                details="Connected network",
+            )
+
+    step = PathTracingStep(data_source, settings, PaloAltoSequencedNextHop())
+
+    result = step.run(validation, gateway)
+
+    assert result.paths
+    path = result.paths[0]
+    assert path.reached_destination is True
+    assert any(hop.egress_interface == firewall_interface.interface_name for hop in path.hops)
+    assert all("blackhole" not in issue.lower() for issue in path.issues)
+    assert path.hops[-1].device_name == dest_record.device_name
+
+
 class NextHopDataSource:
     """Minimal data source for next-hop discovery tests."""
 
@@ -365,6 +530,12 @@ class NextHopDataSource:
 
     def get_device(self, name: str) -> DeviceRecord | None:  # noqa: D401
         return self._device if self._device.name == name else None
+
+    def get_interface_ip(self, device_name: str, interface_name: str):  # noqa: D401,ARG002
+        return None
+
+    def resolve_redundant_gateway(self, address: str):  # noqa: D401,ARG002
+        return None
 
 
 def _build_next_hop_validation(settings: NetworkPathSettings, gateway: IPAddressRecord) -> InputValidationResult:

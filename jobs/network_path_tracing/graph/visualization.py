@@ -71,6 +71,7 @@ def build_pyvis_network(
             smooth = {"enabled": True, "type": direction, "roundness": roundness}
         edge_id = f"{source}->{target}::{key}_{idx}"
         label = data.get("egress_interface") or data.get("next_hop_ip")
+        dashes = bool(data.get("dashed"))
         net.add_edge(
             source,
             target,
@@ -78,6 +79,7 @@ def build_pyvis_network(
             title=title,
             label=label,
             smooth=smooth,
+            dashes=dashes,
         )
 
     return net

@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..config import NetworkPathSettings
 from ..exceptions import PathTracingError, NextHopDiscoveryError
-from ..interfaces.nautobot import NautobotDataSource, IPAddressRecord, PrefixRecord
+from ..interfaces.nautobot import (
+    NautobotDataSource,
+    IPAddressRecord,
+    PrefixRecord,
+    RedundancyMember,
+)
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
 from .next_hop_discovery import NextHopDiscoveryStep
@@ -93,7 +98,8 @@ class PathTracingStep:
             )
         )
 
-        self._add_source_node(graph, validation, start_node_id, start_interface)
+        source_node_id = self._add_source_node(graph, validation, start_node_id, start_interface)
+        self._integrate_redundant_gateways(graph, gateway, start_node_id, source_node_id)
 
         self._completed_paths = []
         self._path_signatures = set()
@@ -298,6 +304,41 @@ class PathTracingStep:
                         details=hop_entry.details,
                     )
                     continue
+                if self._is_destination_on_interface(device_name, egress_interface, destination_ip):
+                    hop_entry = PathHop(
+                        device_name=device_name,
+                        interface_name=interface_name,
+                        next_hop_ip=destination_ip,
+                        egress_interface=egress_interface,
+                        details=f"Destination within subnet of interface '{egress_interface}'.",
+                    )
+                    destination_hop = self._build_destination_hop(destination_ip)
+                    dest_node_id = self._node_id_for_destination(
+                        destination_hop.device_name if destination_hop else None,
+                        destination_ip,
+                    )
+                    graph.mark_destination(
+                        graph.ensure_node(
+                            dest_node_id,
+                            label=(destination_hop.device_name if destination_hop else destination_ip),
+                            device_name=destination_hop.device_name if destination_hop else None,
+                            ip_address=destination_ip,
+                            destination_hop=destination_hop,
+                        )
+                    )
+                    graph.add_edge(
+                        node_id,
+                        dest_node_id,
+                        hop=hop_entry,
+                        next_hop_ip=destination_ip,
+                        egress_interface=egress_interface,
+                        details=hop_entry.details,
+                    )
+                    path_hops = current_hops + [hop_entry]
+                    if destination_hop:
+                        path_hops.append(destination_hop)
+                    self._finalize_path(path_hops, path_issues, reached=True)
+                    continue
                 else:
                     # Not local, treat as failure
                     hop = PathHop(
@@ -418,13 +459,13 @@ class PathTracingStep:
         validation: InputValidationResult,
         start_node_id: str,
         start_interface: Optional[str],
-    ) -> None:
+    ) -> Optional[str]:
         """Ensure source device appears in the graph for visualization."""
 
         record = validation.source_record
         identifier = record.device_name or record.address or validation.source_ip
         if not identifier:
-            return
+            return None
 
         node_id = f"source::{identifier}"
         label = record.device_name or identifier
@@ -446,6 +487,80 @@ class PathTracingStep:
                 source_interface=record.interface_name,
                 target_interface=start_interface,
             )
+
+        return node_id
+
+    def _integrate_redundant_gateways(
+        self,
+        graph: NetworkPathGraph,
+        gateway: GatewayDiscoveryResult,
+        start_node_id: str,
+        source_node_id: Optional[str],
+    ) -> None:
+        """Add redundancy members (e.g., HSRP peers) to the visualization graph."""
+
+        members = getattr(gateway, "redundant_members", None) or ()
+        if not members:
+            return
+
+        preferred_node_id = start_node_id
+        member_nodes: list[tuple[RedundancyMember, str]] = []
+
+        for member in members:
+            if not member.device_name:
+                continue
+            node_id = self._node_id_for_device(member.device_name)
+            node_attrs: Dict[str, Any] = {
+                "label": member.device_name,
+                "device_name": member.device_name,
+                "redundancy_member": True,
+            }
+            graph.ensure_node(node_id, **node_attrs)
+            if member.interface_name:
+                self._append_unique(
+                    graph.graph.nodes[node_id].setdefault("interfaces", []),
+                    member.interface_name,
+                )
+            if member.priority is not None:
+                graph.graph.nodes[node_id]["redundancy_priority"] = member.priority
+            if member.is_preferred:
+                preferred_node_id = node_id
+            member_nodes.append((member, node_id))
+
+        for member, node_id in member_nodes:
+            if member.is_preferred:
+                continue
+            details = (
+                f"Redundancy member (priority {member.priority})"
+                if member.priority is not None
+                else "Redundancy member"
+            )
+            edge_attrs = {
+                "relation": "source->redundant_gateway",
+                "redundancy": True,
+                "redundancy_priority": member.priority,
+                "redundancy_preferred": False,
+                "dashed": True,
+                "details": details,
+                "egress_interface": (
+                    f"prio {member.priority}"
+                    if member.priority is not None
+                    else "standby"
+                ),
+            }
+            if source_node_id and source_node_id != node_id:
+                graph.add_edge(source_node_id, node_id, **edge_attrs)
+            if preferred_node_id and preferred_node_id != node_id:
+                graph.add_edge(
+                    node_id,
+                    preferred_node_id,
+                    relation="redundancy-link",
+                    redundancy=True,
+                    redundancy_priority=member.priority,
+                    redundancy_preferred=False,
+                    dashed=True,
+                    details=details,
+                )
 
     def _build_state_validation(
         self,
@@ -577,6 +692,34 @@ class PathTracingStep:
                 f"{next_hop_record.address}/{next_hop_record.prefix_length}",
                 strict=False,
             )
+            return ipaddress.ip_address(destination_ip) in network
+        except ValueError:
+            return False
+
+    def _is_destination_on_interface(
+        self,
+        device_name: Optional[str],
+        interface_name: Optional[str],
+        destination_ip: str,
+    ) -> bool:
+        """Return True if ``destination_ip`` lies within the interface's subnet."""
+
+        if not device_name or not interface_name:
+            return False
+
+        interface_record = self._data_source.get_interface_ip(device_name, interface_name)
+        if not interface_record or not interface_record.address or not interface_record.prefix_length:
+            return False
+
+        try:
+            network = ipaddress.ip_network(
+                f"{interface_record.address}/{interface_record.prefix_length}",
+                strict=False,
+            )
+        except ValueError:
+            return False
+
+        try:
             return ipaddress.ip_address(destination_ip) in network
         except ValueError:
             return False

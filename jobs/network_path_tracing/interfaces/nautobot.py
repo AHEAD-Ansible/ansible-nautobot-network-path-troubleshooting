@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Protocol
+from dataclasses import dataclass, field
+from typing import Optional, Protocol, Union
 
 
 @dataclass
@@ -33,6 +33,22 @@ class DeviceRecord:
     napalm_driver: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class RedundancyMember:
+    """Represent a member of an interface redundancy group."""
+    device_name: Optional[str]
+    interface_name: Optional[str]
+    priority: Optional[int] = None
+    is_preferred: bool = False
+
+
+@dataclass(frozen=True)
+class RedundancyResolution:
+    """Preferred redundancy member alongside the full membership list."""
+    preferred: IPAddressRecord
+    members: tuple[RedundancyMember, ...] = field(default_factory=tuple)
+
+
 class NautobotDataSource(Protocol):
     """Protocol for retrieving Nautobot data without binding to ORM internals."""
     def get_ip_address(self, address: str) -> Optional[IPAddressRecord]:
@@ -43,3 +59,9 @@ class NautobotDataSource(Protocol):
         """Return the gateway IP within ``prefix`` tagged via ``custom_field`` if present."""
     def get_device(self, name: str) -> Optional[DeviceRecord]:
         """Return the Device record for ``name`` if it exists."""
+    def get_interface_ip(self, device_name: str, interface_name: str) -> Optional[IPAddressRecord]:
+        """Return IP information for ``device_name``/``interface_name`` if available."""
+    def resolve_redundant_gateway(
+        self, address: str
+    ) -> Optional[Union[RedundancyResolution, IPAddressRecord]]:
+        """Return gateway details derived from interface redundancy groups (HSRP/VRRP)."""

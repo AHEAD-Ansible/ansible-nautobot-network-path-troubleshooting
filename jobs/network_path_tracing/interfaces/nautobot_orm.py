@@ -4,15 +4,25 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .nautobot import IPAddressRecord, NautobotDataSource, PrefixRecord, DeviceRecord
+from django.core.exceptions import FieldError
+
+from .nautobot import (
+    IPAddressRecord,
+    NautobotDataSource,
+    PrefixRecord,
+    DeviceRecord,
+    RedundancyMember,
+    RedundancyResolution,
+)
 
 try:
     from nautobot.ipam.models import IPAddress, Prefix
-    from nautobot.dcim.models import Device
+    from nautobot.dcim.models import Device, InterfaceRedundancyGroupAssociation
 except Exception:
     IPAddress = None
     Prefix = None
     Device = None
+    InterfaceRedundancyGroupAssociation = None
 
 
 class NautobotORMDataSource(NautobotDataSource):
@@ -125,6 +135,138 @@ class NautobotORMDataSource(NautobotDataSource):
             platform_slug=platform_slug,
             platform_name=platform_name,
             napalm_driver=napalm_driver,
+        )
+
+    def get_interface_ip(self, device_name: str, interface_name: str) -> Optional[IPAddressRecord]:
+        """Return the first IP assigned to ``device_name``/``interface_name``.
+
+        Args:
+            device_name: Device name as stored in Nautobot.
+            interface_name: Interface name on the device.
+
+        Returns:
+            Optional[IPAddressRecord]: Interface IP record if present.
+        """
+        if IPAddress is None:
+            raise RuntimeError("Nautobot is not available in this environment")
+        if not device_name or not interface_name:
+            return None
+
+        query_variants = [
+            {
+                "interface_assignments__interface__device__name": device_name,
+                "interface_assignments__interface__name": interface_name,
+            },
+            {
+                "interfaces__device__name": device_name,
+                "interfaces__name": interface_name,
+            },
+            {
+                "assigned_object__device__name": device_name,
+                "assigned_object__name": interface_name,
+            },
+        ]
+
+        for filter_kwargs in query_variants:
+            try:
+                ip_obj = IPAddress.objects.filter(**filter_kwargs).first()
+            except FieldError:
+                continue
+            if ip_obj:
+                return self._build_ip_record(ip_obj)
+
+        return None
+
+    def resolve_redundant_gateway(self, address: str) -> Optional[RedundancyResolution]:
+        """Resolve gateway device/interface from interface redundancy groups (e.g., HSRP)."""
+
+        if IPAddress is None or InterfaceRedundancyGroupAssociation is None:
+            return None
+
+        ip_obj = (
+            IPAddress.objects.filter(host=address)
+            .prefetch_related("interface_redundancy_groups")
+            .first()
+        )
+        if ip_obj is None:
+            return None
+
+        groups_manager = getattr(ip_obj, "interface_redundancy_groups", None)
+        if not groups_manager:
+            return None
+
+        try:
+            groups = list(groups_manager.all())
+        except Exception:  # pragma: no cover - defensive for older Nautobot
+            return None
+        if not groups:
+            return None
+
+        assignments_qs = InterfaceRedundancyGroupAssociation.objects.filter(
+            interface_redundancy_group__in=groups
+        ).select_related("interface__device")
+
+        if not assignments_qs:
+            return None
+
+        enriched_assignments: list[tuple[InterfaceRedundancyGroupAssociation, int, str, str]] = []
+        for assignment in assignments_qs:
+            interface = getattr(assignment, "interface", None)
+            device = getattr(interface, "device", None) if interface else None
+            device_name = getattr(device, "name", None)
+            interface_name = getattr(interface, "name", None)
+            if not device_name or not interface_name:
+                continue
+            priority_value = getattr(assignment, "priority", None)
+            try:
+                priority = int(priority_value)
+            except (TypeError, ValueError):
+                priority = -1
+            enriched_assignments.append((assignment, priority, device_name, interface_name))
+
+        if not enriched_assignments:
+            return None
+
+        enriched_assignments.sort(key=lambda item: (-item[1], item[2], item[3]))
+        chosen_assignment = None
+        for assignment, priority, device_name, interface_name in enriched_assignments:
+            if priority < 0:
+                continue
+            chosen_assignment = (assignment, priority, device_name, interface_name)
+            break
+
+        if chosen_assignment is None:
+            chosen_assignment = enriched_assignments[0]
+
+        assignment_obj, _, _, _ = chosen_assignment
+
+        interface = getattr(assignment_obj, "interface", None)
+        device = getattr(interface, "device", None) if interface else None
+
+        preferred_record = IPAddressRecord(
+            address=str(ip_obj.host),
+            prefix_length=int(ip_obj.mask_length),
+            device_name=getattr(device, "name", None),
+            interface_name=getattr(interface, "name", None),
+        )
+
+        members: list[RedundancyMember] = []
+        for assignment, priority, device_name, interface_name in enriched_assignments:
+            members.append(
+                RedundancyMember(
+                    device_name=device_name,
+                    interface_name=interface_name,
+                    priority=priority if priority >= 0 else None,
+                    is_preferred=(
+                        device_name == preferred_record.device_name
+                        and interface_name == preferred_record.interface_name
+                    ),
+                )
+            )
+
+        return RedundancyResolution(
+            preferred=preferred_record,
+            members=tuple(members),
         )
 
     def _build_ip_record(self, ip_obj: Any, override_address: Optional[str] = None) -> IPAddressRecord:

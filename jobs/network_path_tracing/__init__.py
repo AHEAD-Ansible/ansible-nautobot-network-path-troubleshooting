@@ -2,7 +2,14 @@
 
 from .config import NautobotAPISettings, NetworkPathSettings, PaloAltoSettings, NapalmSettings
 from .exceptions import GatewayDiscoveryError, InputValidationError, NextHopDiscoveryError, PathTracingError
-from .interfaces.nautobot import IPAddressRecord, PrefixRecord, DeviceRecord, NautobotDataSource
+from .interfaces.nautobot import (
+    IPAddressRecord,
+    PrefixRecord,
+    DeviceRecord,
+    NautobotDataSource,
+    RedundancyMember,
+    RedundancyResolution,
+)
 from .interfaces.nautobot_api import NautobotAPIDataSource
 from .interfaces.nautobot_orm import NautobotORMDataSource
 from .interfaces.palo_alto import PaloAltoClient
@@ -26,6 +33,8 @@ __all__ = [
     "PrefixRecord",
     "DeviceRecord",
     "NautobotDataSource",
+    "RedundancyMember",
+    "RedundancyResolution",
     "NautobotAPIDataSource",
     "NautobotORMDataSource",
     "PaloAltoClient",
