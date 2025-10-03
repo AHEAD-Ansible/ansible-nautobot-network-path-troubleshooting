@@ -1,0 +1,107 @@
+{
+    "gateway": {
+        "address": "10.100.100.1",
+        "details": "Gateway tagged via custom field and resolved to interface redundancy member with the highest configured priority for IP 10.100.100.1.",
+        "device_name": "Catalyst-1",
+        "found": true,
+        "interface_name": "Vlan100",
+        "method": "hsrp"
+    },
+    "issues": [],
+    "paths": [
+        {
+            "hops": [
+                {
+                    "details": "Resolved via NAPALM on 'Catalyst-1'",
+                    "device_name": "Catalyst-1",
+                    "egress_interface": "GigabitEthernet1/0/4",
+                    "ingress_interface": "Vlan100",
+                    "next_hop_ip": "172.4.4.2"
+                },
+                {
+                    "details": "Resolved via NX-OS CLI on 'NXOS-2'",
+                    "device_name": "NXOS-2",
+                    "egress_interface": "Eth1/1",
+                    "ingress_interface": "Ethernet1/4",
+                    "next_hop_ip": "172.12.12.1"
+                },
+                {
+                    "details": "Resolved using virtual-router Internal on PA-Outside",
+                    "device_name": "PA-Outside",
+                    "egress_interface": "ethernet1/3",
+                    "ingress_interface": "ethernet1/2",
+                    "next_hop_ip": "172.13.13.2"
+                },
+                {
+                    "details": "Destination within subnet of interface 'vlan.200'.",
+                    "device_name": "PaloAlto-1",
+                    "egress_interface": "vlan.200",
+                    "ingress_interface": "ethernet1/2",
+                    "next_hop_ip": "10.200.200.200"
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-2",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.200.200.200"
+                }
+            ],
+            "issues": [],
+            "path": 1,
+            "reached_destination": true
+        },
+        {
+            "hops": [
+                {
+                    "details": "Resolved via NAPALM on 'Catalyst-1'",
+                    "device_name": "Catalyst-1",
+                    "egress_interface": "GigabitEthernet1/0/3",
+                    "ingress_interface": "Vlan100",
+                    "next_hop_ip": "172.3.3.2"
+                },
+                {
+                    "details": "Resolved via NX-OS CLI on 'NXOS-1'",
+                    "device_name": "NXOS-1",
+                    "egress_interface": "Eth1/1",
+                    "ingress_interface": "Ethernet1/3",
+                    "next_hop_ip": "172.11.11.1"
+                },
+                {
+                    "details": "Resolved using virtual-router Internal on PA-Outside",
+                    "device_name": "PA-Outside",
+                    "egress_interface": "ethernet1/3",
+                    "ingress_interface": "ethernet1/1",
+                    "next_hop_ip": "172.13.13.2"
+                },
+                {
+                    "details": "Destination within subnet of interface 'vlan.200'.",
+                    "device_name": "PA-Inside",
+                    "egress_interface": "vlan.200",
+                    "ingress_interface": "ethernet1/1",
+                    "next_hop_ip": "10.200.200.200"
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-2",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.200.200.200"
+                }
+            ],
+            "issues": [],
+            "path": 2,
+            "reached_destination": true
+        }
+    ],
+    "source": {
+        "address": "10.100.100.100",
+        "device_name": "Server-1",
+        "interface_name": "eth1",
+        "is_host_ip": false,
+        "prefix": "10.100.100.0/24",
+        "prefix_length": 24
+    },
+    "status": "success",
+    "visualization": "See attached 'network_path_trace.html' for interactive graph."
+}

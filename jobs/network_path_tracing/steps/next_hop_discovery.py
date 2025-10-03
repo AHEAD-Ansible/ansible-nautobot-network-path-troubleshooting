@@ -151,15 +151,38 @@ class NextHopDiscoveryStep:
             raise NextHopDiscoveryError(f"No virtual-router found for interface '{ingress_if}' on '{device.name}'")
 
         try:
-            # Try FIB lookup first, fall back to route lookup
-            res = client.fib_lookup(api_key, vr, destination_ip)
-            if not (res["next_hop"] or res["egress_interface"]):
-                res = client.route_lookup(api_key, vr, destination_ip)
+            # Try FIB lookup first, but merge in route-lookup data if the FIB misses anything.
+            fib_result = client.fib_lookup(api_key, vr, destination_ip)
+            merged = dict(fib_result)
+            fallback_used = False
+
+            if not merged.get("next_hop") or not merged.get("egress_interface"):
+                try:
+                    route_result = client.route_lookup(api_key, vr, destination_ip)
+                except RuntimeError as route_exc:
+                    if self._logger:
+                        self._logger.warning(
+                            f"Route-lookup fallback failed on '{device.name}' (VR '{vr}'): {route_exc}",
+                            extra={"grouping": "next-hop-discovery"},
+                        )
+                    route_result = {}
+                else:
+                    if not merged.get("next_hop") and route_result.get("next_hop"):
+                        merged["next_hop"] = route_result["next_hop"]
+                        fallback_used = True
+                    if not merged.get("egress_interface") and route_result.get("egress_interface"):
+                        merged["egress_interface"] = route_result["egress_interface"]
+                        fallback_used = True
+
+            found = bool(merged.get("next_hop") or merged.get("egress_interface"))
+            detail = f"Resolved using virtual-router '{vr}' on '{device.name}'"
+            if fallback_used:
+                detail += " (route-lookup fallback)"
 
             return NextHopDiscoveryResult(
-                found=bool(res["next_hop"] or res["egress_interface"]),
-                next_hops=[{"next_hop_ip": res["next_hop"], "egress_interface": res["egress_interface"]}],
-                details=f"Resolved using virtual-router '{vr}' on '{device.name}'",
+                found=found,
+                next_hops=[{"next_hop_ip": merged.get("next_hop"), "egress_interface": merged.get("egress_interface")}],
+                details=detail,
             )
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Next-hop lookup failed for '{destination_ip}': {exc}") from exc
