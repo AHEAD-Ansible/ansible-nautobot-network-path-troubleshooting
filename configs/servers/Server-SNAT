@@ -24,6 +24,12 @@ ip route replace 172.16.0.0/12 via 10.200.200.1 dev eth0
 
 # No extra static routes via eth1 (only its connected /24 as requested)
 
+{
+  printf 'nameserver 8.8.8.8\n'
+  awk '/^nameserver/{print}' /etc/resolv.conf 2>/dev/null | grep -v '8\.8\.8\.8' || true
+} > /etc/resolv.conf.tmp
+mv /etc/resolv.conf.tmp /etc/resolv.conf
+
 # ---- Minimal HTTP server (HTTP only) ----
 mkdir -p /srv/www
 printf 'OK - hello from %s\n' "$(hostname)" > /srv/www/index.html
