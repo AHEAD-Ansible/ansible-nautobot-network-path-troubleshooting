@@ -3,7 +3,7 @@ set -eux
 
 # ETH0: 10.250.250.205/24 (primary default route)
 ip addr flush dev eth0 || true
-ip addr add 10.250.250.205/24 dev eth0
+ip addr add 10.200.200.205/24 dev eth0
 ip link set eth0 up
 
 # ETH1: 10.251.0.254/24
@@ -19,8 +19,8 @@ ip link set eth2 up
 # Make eth0 the primary default route
 ip route replace default via 192.168.100.1 dev eth2
 
-ip route replace 10.0.0.0/8    via 10.250.250.1 dev eth0
-ip route replace 172.16.0.0/12 via 10.250.250.1 dev eth0
+ip route replace 10.0.0.0/8    via 10.200.200.1 dev eth0
+ip route replace 172.16.0.0/12 via 10.200.200.1 dev eth0
 
 # No extra static routes via eth1 (only its connected /24 as requested)
 
