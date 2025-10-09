@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -30,6 +31,7 @@ class PathHop:
     next_hop_ip: Optional[str]
     egress_interface: Optional[str]
     details: Optional[str]
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -203,7 +205,8 @@ class PathTracingStep:
                 interface_name=interface_name,
                 next_hop_ip=destination_ip,
                 egress_interface=dest_record.interface_name,
-                details="Reached destination on current device (local route)."
+                details="Reached destination on current device (local route).",
+                extras={},
             )
             path_hops = current_hops + [hop_entry]
             self._finalize_path(path_hops, path_issues, reached=True)
@@ -250,6 +253,7 @@ class PathTracingStep:
                 next_hop_ip=None,
                 egress_interface=None,
                 details=str(exc),
+                extras={},
             )
             current_hops.append(hop)
             self._record_issue(path_issues, aggregate_issues, f"Next-hop lookup failed: {exc}")
@@ -264,6 +268,7 @@ class PathTracingStep:
                 next_hop_ip=None,
                 egress_interface=None,
                 details=next_hop_result.details,
+                extras={},
             )
             current_hops.append(hop)
             self._record_issue(path_issues, aggregate_issues, "Routing blackhole detected: no next hop found.")
@@ -274,16 +279,20 @@ class PathTracingStep:
         for next_hop in next_hop_result.next_hops:
             next_hop_ip = next_hop.get("next_hop_ip")
             egress_interface = next_hop.get("egress_interface")
+            extras = self._extract_hop_extras(next_hop)
+            display_interface = extras.get("ingress_interface") or interface_name
+            display_egress = extras.get("egress_interface") or egress_interface
 
             # Handle local route if next_hop_ip is None or indicator of local
             if next_hop_ip in (None, '', 'local', '0.0.0.0'):
                 if dest_record and dest_record.device_name == device_name:
                     hop_entry = PathHop(
                         device_name=device_name,
-                        interface_name=interface_name,
+                        interface_name=display_interface,
                         next_hop_ip=destination_ip,
-                        egress_interface=egress_interface,
-                        details="Local route to destination."
+                        egress_interface=display_egress,
+                        details="Local route to destination.",
+                        extras=extras,
                     )
                     path_hops = current_hops + [hop_entry]
                     self._finalize_path(path_hops, path_issues, reached=True)
@@ -304,13 +313,14 @@ class PathTracingStep:
                         details=hop_entry.details,
                     )
                     continue
-                if self._is_destination_on_interface(device_name, egress_interface, destination_ip):
+                if self._is_destination_on_interface(device_name, display_egress, destination_ip):
                     hop_entry = PathHop(
                         device_name=device_name,
-                        interface_name=interface_name,
+                        interface_name=display_interface,
                         next_hop_ip=destination_ip,
-                        egress_interface=egress_interface,
+                        egress_interface=display_egress,
                         details=f"Destination within subnet of interface '{egress_interface}'.",
+                        extras=extras,
                     )
                     destination_hop = self._build_destination_hop(destination_ip)
                     dest_node_id = self._node_id_for_destination(
@@ -331,7 +341,7 @@ class PathTracingStep:
                         dest_node_id,
                         hop=hop_entry,
                         next_hop_ip=destination_ip,
-                        egress_interface=egress_interface,
+                        egress_interface=display_egress,
                         details=hop_entry.details,
                     )
                     path_hops = current_hops + [hop_entry]
@@ -343,10 +353,11 @@ class PathTracingStep:
                     # Not local, treat as failure
                     hop = PathHop(
                         device_name=device_name,
-                        interface_name=interface_name,
+                        interface_name=display_interface,
                         next_hop_ip=None,
-                        egress_interface=egress_interface,
-                        details="No next hop; possible blackhole."
+                        egress_interface=display_egress,
+                        details="No next hop; possible blackhole.",
+                        extras=extras,
                     )
                     current_hops.append(hop)
                     self._record_issue(path_issues, aggregate_issues, "Routing blackhole detected.")
@@ -357,10 +368,11 @@ class PathTracingStep:
 
             hop_entry = PathHop(
                 device_name=device_name,
-                interface_name=interface_name,
+                interface_name=display_interface,
                 next_hop_ip=next_hop_ip,
-                egress_interface=egress_interface,
+                egress_interface=display_egress,
                 details=next_hop_result.details,
+                extras=extras,
             )
 
             next_device_name = next_hop_record.device_name if next_hop_record else None
@@ -390,7 +402,7 @@ class PathTracingStep:
                     dest_node_id,
                     hop=hop_entry,
                     next_hop_ip=next_hop_ip,
-                    egress_interface=egress_interface,
+                    egress_interface=display_egress,
                     details=next_hop_result.details,
                 )
                 path_hops = current_hops + [hop_entry]
@@ -404,7 +416,7 @@ class PathTracingStep:
                 source_node_id=node_id,
                 device_name=next_device_name,
                 next_hop_ip=next_hop_ip,
-                egress_interface=egress_interface,
+                egress_interface=display_egress,
             )
 
             graph.ensure_node(
@@ -424,7 +436,7 @@ class PathTracingStep:
                 target_node_id,
                 hop=hop_entry,
                 next_hop_ip=next_hop_ip,
-                egress_interface=egress_interface,
+                egress_interface=display_egress,
                 details=next_hop_result.details,
             )
 
@@ -609,6 +621,18 @@ class PathTracingStep:
             container.append(value)
 
     @staticmethod
+    def _extract_hop_extras(next_hop: Dict[str, Any]) -> Dict[str, Any]:
+        """Return hop metadata excluding standard keys."""
+
+        if not isinstance(next_hop, dict):
+            return {}
+        return {
+            key: value
+            for key, value in next_hop.items()
+            if key not in {"next_hop_ip", "egress_interface"}
+        }
+
+    @staticmethod
     def _record_issue(
         path_issues: List[str], aggregate: List[str], message: str
     ) -> None:
@@ -631,6 +655,7 @@ class PathTracingStep:
                 hop.next_hop_ip,
                 hop.egress_interface,
                 hop.details,
+                json.dumps(hop.extras, sort_keys=True, default=str),
             )
             for hop in hops
         ) + (reached,)
@@ -736,6 +761,7 @@ class PathTracingStep:
                 next_hop_ip=destination_ip,
                 egress_interface=None,
                 details=details,
+                extras={},
             )
 
         return PathHop(
@@ -744,4 +770,5 @@ class PathTracingStep:
             next_hop_ip=destination_ip,
             egress_interface=None,
             details="Destination device info not found in Nautobot",
+            extras={},
         )

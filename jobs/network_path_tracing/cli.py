@@ -7,7 +7,7 @@ import json
 import sys
 from getpass import getpass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .config import NapalmSettings, NetworkPathSettings, _DEFAULT_DESTINATION_IP, _DEFAULT_SOURCE_IP
 from .exceptions import (
@@ -24,7 +24,44 @@ from .steps import (
     InputValidationStep,
     NextHopDiscoveryStep,
     PathTracingStep,
+    PathHop,
+    Path as TracedPath,
 )
+
+
+def _hop_to_payload(hop: PathHop) -> Dict[str, Any]:
+    """Serialize PathHop instances for CLI output."""
+
+    payload: Dict[str, Any] = {
+        "device_name": hop.device_name,
+        "ingress_interface": hop.interface_name,
+        "egress_interface": hop.egress_interface,
+        "next_hop_ip": hop.next_hop_ip,
+        "details": hop.details,
+    }
+    for key, value in (hop.extras or {}).items():
+        if value is None:
+            continue
+        if key in payload and payload[key] not in (None, "", []):
+            continue
+        payload[key] = value
+    return payload
+
+
+def _build_destination_summary(paths: list[TracedPath]) -> Optional[Dict[str, Any]]:
+    """Return minimal destination details from the first successful path."""
+
+    for path in paths:
+        if not path.reached_destination or not path.hops:
+            continue
+        last_hop = path.hops[-1]
+        if not last_hop.next_hop_ip:
+            continue
+        return {
+            "address": last_hop.next_hop_ip,
+            "device_name": last_hop.device_name,
+        }
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +156,7 @@ def run_steps(
         gateway_custom_field=base_settings.gateway_custom_field,
         pa=base_settings.pa,
         napalm=effective_napalm,
+        f5=base_settings.f5,
     )
 
     source = select_data_source(settings, data_source)
@@ -163,13 +201,7 @@ def run_steps(
             {
                 "path": index,
                 "hops": [
-                    {
-                        "device_name": hop.device_name,
-                        "ingress_interface": hop.interface_name,
-                        "egress_interface": hop.egress_interface,
-                        "next_hop_ip": hop.next_hop_ip,
-                        "details": hop.details,
-                    }
+                    _hop_to_payload(hop)
                     for hop in path.hops
                 ],
                 "reached_destination": path.reached_destination,
@@ -179,6 +211,10 @@ def run_steps(
         ],
         "issues": path_result.issues,
     }
+
+    destination_summary = _build_destination_summary(path_result.paths)
+    if destination_summary:
+        payload["destination"] = destination_summary
 
     if debug:
         payload["debug"] = {

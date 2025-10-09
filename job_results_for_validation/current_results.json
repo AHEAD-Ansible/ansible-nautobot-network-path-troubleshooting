@@ -7,9 +7,7 @@
         "interface_name": "Vlan100",
         "method": "hsrp"
     },
-    "issues": [
-        "Routing blackhole detected."
-    ],
+    "issues": [],
     "paths": [
         {
             "hops": [
@@ -28,18 +26,60 @@
                     "next_hop_ip": "172.12.12.1"
                 },
                 {
-                    "details": "No next hop; possible blackhole.",
+                    "details": "Resolved using virtual-router 'Internal' on 'PA-Outside'",
                     "device_name": "PA-Outside",
                     "egress_interface": "ethernet1/3",
                     "ingress_interface": "ethernet1/2",
-                    "next_hop_ip": null
+                    "next_hop_ip": "172.13.13.2"
+                },
+                {
+                    "details": "Resolved using virtual-router 'Internal' on 'PA-Inside'",
+                    "device_name": "PA-Inside",
+                    "egress_interface": "ethernet1/3",
+                    "ingress_interface": "ethernet1/1",
+                    "next_hop_ip": "172.20.20.2"
+                },
+                {
+                    "destination_ip": "10.251.0.205",
+                    "details": "Resolved via F5 API on 'BIGIP-1'",
+                    "device_name": "BIGIP-1",
+                    "egress_interface": "1.2",
+                    "egress_interfaces": [
+                        "1.2"
+                    ],
+                    "egress_self_ip": "/Common/self_internal",
+                    "egress_self_ip_address": "10.251.0.1/24",
+                    "egress_vlan": "/Common/vlan_internal",
+                    "ingress_interface": "vlan_external",
+                    "next_hop": "10.251.0.205",
+                    "next_hop_ip": "10.251.0.205",
+                    "pools_containing_member": [
+                        "/Common/pool_web_http"
+                    ],
+                    "virtual_servers": [
+                        {
+                            "destination": "/Common/10.249.0.100:80",
+                            "name": "/Common/vs_web_http_10.249.0.100_80",
+                            "virtual_address": "/Common/10.249.0.100"
+                        },
+                        {
+                            "destination": "/Common/10.249.0.100:443",
+                            "name": "/Common/vs_web_https_10.249.0.100_443",
+                            "virtual_address": "/Common/10.249.0.100"
+                        }
+                    ]
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-SNAT",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.251.0.205"
                 }
             ],
-            "issues": [
-                "Routing blackhole detected."
-            ],
+            "issues": [],
             "path": 1,
-            "reached_destination": false
+            "reached_destination": true
         },
         {
             "hops": [
@@ -58,18 +98,60 @@
                     "next_hop_ip": "172.11.11.1"
                 },
                 {
-                    "details": "No next hop; possible blackhole.",
+                    "details": "Resolved using virtual-router 'Internal' on 'PA-Outside'",
                     "device_name": "PA-Outside",
                     "egress_interface": "ethernet1/3",
                     "ingress_interface": "ethernet1/1",
-                    "next_hop_ip": null
+                    "next_hop_ip": "172.13.13.2"
+                },
+                {
+                    "details": "Resolved using virtual-router 'Internal' on 'PA-Inside'",
+                    "device_name": "PA-Inside",
+                    "egress_interface": "ethernet1/3",
+                    "ingress_interface": "ethernet1/1",
+                    "next_hop_ip": "172.20.20.2"
+                },
+                {
+                    "destination_ip": "10.251.0.205",
+                    "details": "Resolved via F5 API on 'BIGIP-1'",
+                    "device_name": "BIGIP-1",
+                    "egress_interface": "1.2",
+                    "egress_interfaces": [
+                        "1.2"
+                    ],
+                    "egress_self_ip": "/Common/self_internal",
+                    "egress_self_ip_address": "10.251.0.1/24",
+                    "egress_vlan": "/Common/vlan_internal",
+                    "ingress_interface": "vlan_external",
+                    "next_hop": "10.251.0.205",
+                    "next_hop_ip": "10.251.0.205",
+                    "pools_containing_member": [
+                        "/Common/pool_web_http"
+                    ],
+                    "virtual_servers": [
+                        {
+                            "destination": "/Common/10.249.0.100:80",
+                            "name": "/Common/vs_web_http_10.249.0.100_80",
+                            "virtual_address": "/Common/10.249.0.100"
+                        },
+                        {
+                            "destination": "/Common/10.249.0.100:443",
+                            "name": "/Common/vs_web_https_10.249.0.100_443",
+                            "virtual_address": "/Common/10.249.0.100"
+                        }
+                    ]
+                },
+                {
+                    "details": "Destination device resolved via Nautobot",
+                    "device_name": "Server-SNAT",
+                    "egress_interface": null,
+                    "ingress_interface": "eth1",
+                    "next_hop_ip": "10.251.0.205"
                 }
             ],
-            "issues": [
-                "Routing blackhole detected."
-            ],
+            "issues": [],
             "path": 2,
-            "reached_destination": false
+            "reached_destination": true
         }
     ],
     "source": {

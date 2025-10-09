@@ -3,13 +3,14 @@
 import json
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 if "napalm" not in sys.modules:
     sys.modules["napalm"] = SimpleNamespace(get_network_driver=lambda *_args, **_kwargs: None)
 
-from jobs.network_path_tracing import NetworkPathSettings, NapalmSettings
+from jobs.network_path_tracing import NetworkPathSettings, NapalmSettings, F5Settings
 from jobs.network_path_tracing import GatewayDiscoveryError, InputValidationError
 from jobs.network_path_tracing.interfaces.nautobot import (
     IPAddressRecord,
@@ -28,6 +29,7 @@ from jobs.network_path_tracing.steps import (
     PathTracingStep,
 )
 import jobs.network_path_tracing.steps.next_hop_discovery as next_hop_module
+from jobs.network_path_tracing.interfaces.f5_bigip import F5NextHopSummary
 
 
 class FakeDataSource:
@@ -302,7 +304,11 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
 
     next_hop_result = NextHopDiscoveryResult(
         found=True,
-        next_hops=[{"next_hop_ip": default_settings.destination_ip, "egress_interface": "Gig0/1"}],
+        next_hops=[{
+            "next_hop_ip": default_settings.destination_ip,
+            "egress_interface": "Gig0/1",
+            "probe": "f5",
+        }],
         details="direct",
     )
 
@@ -328,6 +334,8 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
     assert path.hops[0].next_hop_ip == default_settings.destination_ip
     assert path.hops[1].device_name == "dest-host"
     assert path.hops[1].details == "Destination device resolved via Nautobot"
+    assert path.hops[0].extras == {"probe": "f5"}
+    assert path.hops[1].extras == {}
 
 
 def test_path_tracing_blackhole(default_settings, path_gateway, path_validation):
@@ -974,6 +982,91 @@ def test_next_hop_caches_results(monkeypatch):
 
     assert first == second
     assert calls.count("ios") == 1
+
+
+def test_next_hop_f5_lookup(monkeypatch):
+    """F5 platforms should leverage the BIG-IP API for next-hop metadata."""
+
+    summary = F5NextHopSummary(
+        destination_ip="10.20.20.20",
+        pools_containing_member=["/Common/pool_web_http"],
+        virtual_servers=[
+            {
+                "name": "/Common/vs_web_http",
+                "virtual_address": "10.249.0.100",
+            }
+        ],
+        next_hop_ip="10.20.20.20",
+        ingress_vlan="/Common/vlan_external",
+        ingress_interface="1.1",
+        egress_vlan="/Common/vlan_internal",
+        egress_interface="1.2",
+        egress_self_ip="/Common/self_internal",
+        egress_self_ip_address="10.251.0.1/24",
+    )
+
+    captured: dict[str, Any] = {}
+
+    class DummyF5Client:
+        def __init__(self, host, username, password, verify_ssl, timeout=10):  # noqa: D401
+            captured.update({
+                "host": host,
+                "username": username,
+                "password": password,
+                "verify_ssl": verify_ssl,
+                "timeout": timeout,
+            })
+
+        def collect_destination_summary(self, dest_ip, partitions=None, ingress_hint=None):  # noqa: D401
+            captured["dest_ip"] = dest_ip
+            captured["partitions"] = partitions
+            captured["ingress_hint"] = ingress_hint
+            return summary
+
+    monkeypatch.setattr(next_hop_module, "F5Client", DummyF5Client)
+
+    settings = NetworkPathSettings(
+        source_ip="10.10.10.10",
+        destination_ip="10.20.20.20",
+        f5=F5Settings(username="f5-user", password="secret", verify_ssl=False, partitions=("Common",)),
+    )
+    device = DeviceRecord(
+        name="F5-LTM",
+        primary_ip="192.0.2.80",
+        platform_slug="f5-bigip",
+        platform_name="F5 BIG-IP",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="F5-LTM",
+        interface_name="Vlan200",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert "F5 API" in (result.details or "")
+    next_hop_entry = result.next_hops[0]
+    assert next_hop_entry["next_hop_ip"] == settings.destination_ip
+    assert next_hop_entry["egress_interface"] == summary.egress_interface
+    assert next_hop_entry["ingress_vlan"] == summary.ingress_vlan
+    assert next_hop_entry["ingress_interface"] == summary.ingress_interface
+    assert next_hop_entry["pools_containing_member"] == summary.pools_containing_member
+    assert next_hop_entry["virtual_servers"] == summary.virtual_servers
+    assert captured == {
+        "host": "192.0.2.80",
+        "username": "f5-user",
+        "password": "secret",
+        "verify_ssl": False,
+        "timeout": 10,
+        "dest_ip": "10.20.20.20",
+        "partitions": ("Common",),
+        "ingress_hint": "Vlan200",
+    }
 
 
 def test_nxos_prefix_table_format(monkeypatch):

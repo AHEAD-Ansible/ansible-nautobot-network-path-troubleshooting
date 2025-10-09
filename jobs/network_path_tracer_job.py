@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from nautobot.apps.jobs import IPAddressVar, Job
 from nautobot.extras.choices import JobResultStatusChoices
@@ -23,6 +23,8 @@ from network_path_tracing import (  # Changed to absolute import
     NextHopDiscoveryStep,
     PathTracingError,
     PathTracingStep,
+    PathHop,
+    Path,
     build_pyvis_network,
 )
 
@@ -160,13 +162,7 @@ class NetworkPathTracerJob(Job):
                     {
                         "path": index,
                         "hops": [
-                            {
-                                "device_name": hop.device_name,
-                                "ingress_interface": hop.interface_name,
-                                "egress_interface": hop.egress_interface,
-                                "next_hop_ip": hop.next_hop_ip,
-                                "details": hop.details,
-                            }
+                            self._hop_to_payload(hop)
                             for hop in path.hops
                         ],
                         "reached_destination": path.reached_destination,
@@ -176,6 +172,10 @@ class NetworkPathTracerJob(Job):
                 ],
                 "issues": path_result.issues,
             }
+
+            destination_summary = self._build_destination_summary(path_result.paths)
+            if destination_summary:
+                result_payload["destination"] = destination_summary
 
             if visualization_attached:
                 result_payload["visualization"] = "See attached 'network_path_trace.html' for interactive graph."
@@ -219,3 +219,40 @@ class NetworkPathTracerJob(Job):
         if isinstance(value, str):
             return value.split("/")[0]
         return str(value).split("/")[0]
+
+    @staticmethod
+    def _hop_to_payload(hop: PathHop) -> Dict[str, Any]:
+        """Serialize a PathHop, merging any extra metadata."""
+
+        payload: Dict[str, Any] = {
+            "device_name": hop.device_name,
+            "ingress_interface": hop.interface_name,
+            "egress_interface": hop.egress_interface,
+            "next_hop_ip": hop.next_hop_ip,
+            "details": hop.details,
+        }
+        for key, value in (hop.extras or {}).items():
+            if value is None:
+                continue
+            if key in payload and payload[key] not in (None, "", []):
+                continue
+            payload[key] = value
+        return payload
+
+    @staticmethod
+    def _build_destination_summary(paths: list[Path]) -> Optional[Dict[str, Any]]:
+        """Derive destination info from the first successful path."""
+
+        for path in paths:
+            if not path.reached_destination:
+                continue
+            if not path.hops:
+                continue
+            last_hop = path.hops[-1]
+            if not last_hop.next_hop_ip:
+                continue
+            return {
+                "address": last_hop.next_hop_ip,
+                "device_name": last_hop.device_name,
+            }
+        return None

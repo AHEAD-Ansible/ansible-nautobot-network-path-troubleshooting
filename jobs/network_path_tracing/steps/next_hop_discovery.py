@@ -7,10 +7,13 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import requests
+
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
 from ..interfaces.palo_alto import PaloAltoClient
+from ..interfaces.f5_bigip import F5Client, F5APIError
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
 
@@ -37,6 +40,7 @@ class NextHopDiscoveryStep:
 
     _NXOS_DRIVERS = {"nxos", "nxos_ssh"}
     _PALO_ALTO_INDICATORS = {"palo", "panos", "palo_alto"}
+    _F5_INDICATORS = {"f5", "bigip"}
 
     def __init__(
         self,
@@ -88,6 +92,10 @@ class NextHopDiscoveryStep:
             indicator in platform_slug_lower or indicator in platform_name_lower
             for indicator in self._PALO_ALTO_INDICATORS
         )
+        is_f5 = any(
+            indicator in platform_slug_lower or indicator in platform_name_lower
+            for indicator in self._F5_INDICATORS
+        )
 
         if is_palo_alto:
             if self._logger:
@@ -97,6 +105,19 @@ class NextHopDiscoveryStep:
                 )
             try:
                 result = self._run_palo_alto_lookup(device, ingress_if, validation.destination_ip)
+                self._cache[cache_key] = result
+                return result
+            except NextHopDiscoveryError as exc:
+                self._cache[cache_key] = str(exc)
+                raise
+        elif is_f5:
+            if self._logger:
+                self._logger.info(
+                    f"Detected F5 BIG-IP device '{device.name}' (platform: {device.platform_slug or device.platform_name})",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+            try:
+                result = self._run_f5_lookup(device, ingress_if, validation.destination_ip)
                 self._cache[cache_key] = result
                 return result
             except NextHopDiscoveryError as exc:
@@ -186,6 +207,47 @@ class NextHopDiscoveryStep:
             )
         except RuntimeError as exc:
             raise NextHopDiscoveryError(f"Next-hop lookup failed for '{destination_ip}': {exc}") from exc
+
+    def _run_f5_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
+        """Perform next-hop lookup for F5 BIG-IP devices."""
+        if not device.primary_ip:
+            raise NextHopDiscoveryError(f"No management IP found for F5 device '{device.name}'")
+
+        f5_settings = self._settings.f5_settings()
+        if not f5_settings:
+            raise NextHopDiscoveryError("F5 credentials not configured (set F5_USERNAME and F5_PASSWORD)")
+
+        client = F5Client(
+            host=device.primary_ip,
+            username=f5_settings.username,
+            password=f5_settings.password,
+            verify_ssl=f5_settings.verify_ssl,
+        )
+
+        try:
+            summary = client.collect_destination_summary(
+                destination_ip,
+                partitions=f5_settings.partitions_list(),
+                ingress_hint=ingress_if,
+            )
+        except (requests.RequestException, F5APIError) as exc:
+            raise NextHopDiscoveryError(f"F5 API lookup failed for '{device.name}': {exc}") from exc
+
+        extras = summary.as_dict()
+        hop_next_ip = summary.next_hop_ip or destination_ip
+        egress_interface = summary.egress_interface
+
+        return NextHopDiscoveryResult(
+            found=True,
+            next_hops=[
+                {
+                    "next_hop_ip": hop_next_ip,
+                    "egress_interface": egress_interface,
+                    **extras,
+                }
+            ],
+            details=f"Resolved via F5 API on '{device.name}'",
+        )
 
     def _run_napalm_lookup(self, device: DeviceRecord, ingress_if: str, destination_ip: str) -> NextHopDiscoveryResult:
         """Perform next-hop lookup using NAPALM for non-Palo Alto devices.
