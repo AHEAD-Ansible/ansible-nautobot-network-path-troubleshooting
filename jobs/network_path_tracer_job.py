@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import ipaddress
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
-from nautobot.apps.jobs import IPAddressVar, Job
-from nautobot.extras.choices import JobResultStatusChoices
-from nautobot.extras.models import CustomField
-from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices
 from django.core.exceptions import ObjectDoesNotExist, FieldError
-from nautobot.apps.jobs import register_jobs
+from nautobot.apps.jobs import IPAddressVar, Job, ObjectVar, register_jobs
+from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
+from nautobot.extras.models import CustomField, SecretsGroup
+from nautobot.extras.secrets.exceptions import SecretError
 
 from network_path_tracing import (  # Changed to absolute import
     GatewayDiscoveryError,
@@ -47,7 +47,7 @@ class NetworkPathTracerJob(Job):
         has_sensitive_variables = False
         read_only = True
         dryrun_default = False  # Explicit for clarity, though read_only
-        field_order = ["source_ip", "destination_ip"]  # UI form order
+        field_order = ["source_ip", "destination_ip", "secrets_group"]  # UI form order
         # soft_time_limit / time_limit could be added if long-running
 
     source_ip = IPAddressVar(
@@ -59,12 +59,19 @@ class NetworkPathTracerJob(Job):
         required=True,
     )
 
-    def run(self, *, source_ip: str, destination_ip: str, **kwargs) -> dict:
+    secrets_group = ObjectVar(
+        model=SecretsGroup,
+        description="Secrets Group providing Generic username/password credentials for device lookups.",
+        required=True,
+    )
+
+    def run(self, *, source_ip: str, destination_ip: str, secrets_group: SecretsGroup, **kwargs) -> dict:
         """Execute the full network path tracing workflow.
 
         Args:
             source_ip (str): Source IP address (e.g., '10.0.0.1').
             destination_ip (str): Destination IP address (e.g., '4.2.2.1').
+            secrets_group (SecretsGroup): Selected secrets group supplying credentials.
             **kwargs: Additional keyword arguments passed by Nautobot (logged for debugging).
 
         Returns:
@@ -95,12 +102,60 @@ class NetworkPathTracerJob(Job):
             self._fail_job(f"Invalid IP address: {exc}")
             return {}  # Nautobot handles return on failure
 
-        # Initialize settings
-        settings = NetworkPathSettings(
+        # Retrieve credentials from the selected Secrets Group
+        try:
+            username = secrets_group.get_secret_value(
+                SecretsGroupAccessTypeChoices.TYPE_GENERIC,
+                SecretsGroupSecretTypeChoices.TYPE_USERNAME,
+                obj=None,
+            )
+        except ObjectDoesNotExist:
+            self._fail_job(
+                f"Secrets Group '{secrets_group}' does not define a Generic/username secret. "
+                "Add the credential to the group or choose a different Secrets Group."
+            )
+            return {}
+        except SecretError as exc:
+            self._fail_job(
+                f"Unable to retrieve username from Secrets Group '{secrets_group}': {exc.message}"
+            )
+            return {}
+
+        try:
+            password = secrets_group.get_secret_value(
+                SecretsGroupAccessTypeChoices.TYPE_GENERIC,
+                SecretsGroupSecretTypeChoices.TYPE_PASSWORD,
+                obj=None,
+            )
+        except ObjectDoesNotExist:
+            self._fail_job(
+                f"Secrets Group '{secrets_group}' does not define a Generic/password secret. "
+                "Add the credential to the group or choose a different Secrets Group."
+            )
+            return {}
+        except SecretError as exc:
+            self._fail_job(
+                f"Unable to retrieve password from Secrets Group '{secrets_group}': {exc.message}"
+            )
+            return {}
+
+        # Initialize settings and override credentials with secrets group values
+        base_settings = NetworkPathSettings(
             source_ip=self._to_address_string(source_ip),
             destination_ip=self._to_address_string(destination_ip),
         )
-        self.logger.debug(msg=f"Normalized settings: source_ip={settings.source_ip}, destination_ip={settings.destination_ip}")
+        settings = replace(
+            base_settings,
+            pa=replace(base_settings.pa, username=username, password=password),
+            napalm=replace(base_settings.napalm, username=username, password=password),
+            f5=replace(base_settings.f5, username=username, password=password),
+        )
+        self.logger.debug(
+            msg=(
+                f"Normalized settings: source_ip={settings.source_ip}, "
+                f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
+            )
+        )
 
         # Initialize workflow steps (modular for testability)
         data_source = NautobotORMDataSource()
