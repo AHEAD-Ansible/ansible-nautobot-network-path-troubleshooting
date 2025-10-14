@@ -41,3 +41,13 @@ class PathTracingError(RuntimeError):
 
     def __str__(self) -> str:
         return self.message
+
+
+class InterfaceStatsError(RuntimeError):
+    """Raised when interface statistics collection fails."""
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message

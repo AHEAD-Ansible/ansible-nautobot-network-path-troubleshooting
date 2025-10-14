@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ipaddress
+from collections import defaultdict
 from dataclasses import replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from django.core.exceptions import ObjectDoesNotExist, FieldError
-from nautobot.apps.jobs import IPAddressVar, Job, ObjectVar, register_jobs
+from nautobot.apps.jobs import BooleanVar, IPAddressVar, Job, ObjectVar, register_jobs
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import CustomField, SecretsGroup
 from nautobot.extras.secrets.exceptions import SecretError
@@ -26,7 +27,10 @@ from network_path_tracing import (  # Changed to absolute import
     PathHop,
     Path,
     build_pyvis_network,
+    InterfaceStats,
+    InterfaceStatsService,
 )
+from network_path_tracing.exceptions import InterfaceStatsError
 
 
 @register_jobs
@@ -47,7 +51,7 @@ class NetworkPathTracerJob(Job):
         has_sensitive_variables = False
         read_only = True
         dryrun_default = False  # Explicit for clarity, though read_only
-        field_order = ["source_ip", "destination_ip", "secrets_group"]  # UI form order
+        field_order = ["source_ip", "destination_ip", "secrets_group", "collect_interface_stats"]  # UI form order
         # soft_time_limit / time_limit could be added if long-running
 
     source_ip = IPAddressVar(
@@ -65,7 +69,21 @@ class NetworkPathTracerJob(Job):
         required=True,
     )
 
-    def run(self, *, source_ip: str, destination_ip: str, secrets_group: SecretsGroup, **kwargs) -> dict:
+    collect_interface_stats = BooleanVar(
+        description="Attach ingress/egress interface statistics for every hop in the traced path.",
+        required=False,
+        default=False,
+    )
+
+    def run(
+        self,
+        *,
+        source_ip: str,
+        destination_ip: str,
+        secrets_group: SecretsGroup,
+        collect_interface_stats: bool = False,
+        **kwargs,
+    ) -> dict:
         """Execute the full network path tracing workflow.
 
         Args:
@@ -89,6 +107,7 @@ class NetworkPathTracerJob(Job):
         """
         # Log job start
         self.logger.info(msg=f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}")
+        self._interface_stats_cache: Dict[str, Dict[str, Dict[str, object]]] = {}
 
         # Log unexpected kwargs (robustness)
         if kwargs:
@@ -180,6 +199,15 @@ class NetworkPathTracerJob(Job):
             path_result = path_tracing_step.run(validation, gateway)
             self.logger.success("Path tracing completed successfully")
 
+            if collect_interface_stats:
+                self._interface_stats_cache = self._collect_interface_stats(
+                    path_result.paths,
+                    data_source,
+                    settings,
+                )
+            else:
+                self._interface_stats_cache = {}
+
             # Generate visualization if graph is available (optional dependency)
             visualization_attached = False
             if path_result.graph:
@@ -260,6 +288,44 @@ class NetworkPathTracerJob(Job):
         self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
         raise RuntimeError(message)  # Use RuntimeError for general failures
 
+    def _collect_interface_stats(
+        self,
+        paths: List[Path],
+        data_source: NautobotORMDataSource,
+        settings: NetworkPathSettings,
+    ) -> Dict[str, Dict[str, Dict[str, object]]]:
+        """Collect interface statistics for every hop in the traced paths."""
+        service = InterfaceStatsService(data_source, settings, logger=self.logger)
+        requests_by_device: Dict[str, Set[str]] = defaultdict(set)
+        for path in paths:
+            for hop in path.hops:
+                if not hop.device_name:
+                    continue
+                if hop.interface_name:
+                    requests_by_device[hop.device_name].add(hop.interface_name)
+                if hop.egress_interface:
+                    requests_by_device[hop.device_name].add(hop.egress_interface)
+
+        stats_cache: Dict[str, Dict[str, Dict[str, object]]] = {}
+        for device_name, interfaces in requests_by_device.items():
+            if not interfaces:
+                continue
+            try:
+                stats = service.collect_by_device_name(device_name, list(interfaces))
+            except InterfaceStatsError as exc:
+                self.logger.warning(
+                    f"Interface statistics collection failed for '{device_name}': {exc}",
+                    extra={"grouping": "interface-stats"},
+                )
+                continue
+            device_map: Dict[str, Dict[str, object]] = {}
+            for iface_name, iface_stats in stats.items():
+                payload = iface_stats.to_dict() if isinstance(iface_stats, InterfaceStats) else iface_stats
+                device_map[iface_name.lower()] = payload
+            if device_map:
+                stats_cache[device_name] = device_map
+        return stats_cache
+
     @staticmethod
     def _to_address_string(value: str) -> str:
         """Normalize Nautobot job input to a plain string IP address.
@@ -286,6 +352,22 @@ class NetworkPathTracerJob(Job):
             "next_hop_ip": hop.next_hop_ip,
             "details": hop.details,
         }
+
+        stats_cache = getattr(self, "_interface_stats_cache", {})
+        device_stats = stats_cache.get(hop.device_name) if hop.device_name else None
+        if device_stats:
+            interface_stats_payload: Dict[str, Dict[str, object]] = {}
+            if hop.interface_name:
+                ingress = device_stats.get(hop.interface_name.lower())
+                if ingress:
+                    interface_stats_payload["ingress"] = ingress
+            if hop.egress_interface:
+                egress = device_stats.get(hop.egress_interface.lower())
+                if egress:
+                    interface_stats_payload["egress"] = egress
+            if interface_stats_payload:
+                payload["interface_stats"] = interface_stats_payload
+
         for key, value in (hop.extras or {}).items():
             if value is None:
                 continue

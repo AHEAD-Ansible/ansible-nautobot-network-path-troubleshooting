@@ -14,6 +14,14 @@ from ..exceptions import NextHopDiscoveryError
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
 from ..interfaces.palo_alto import PaloAltoClient
 from ..interfaces.f5_bigip import F5Client, F5APIError
+from ..interfaces.platform_utils import (
+    is_f5_bigip,
+    is_palo_alto,
+    napalm_driver_attempts,
+    napalm_optional_args,
+    nxos_drivers,
+    select_napalm_driver,
+)
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
 
@@ -37,10 +45,6 @@ class NextHopDiscoveryStep:
     Handles Palo Alto devices via their API and other platforms via NAPALM.
     Ensures robust platform detection to avoid incorrect driver usage.
     """
-
-    _NXOS_DRIVERS = {"nxos", "nxos_ssh"}
-    _PALO_ALTO_INDICATORS = {"palo", "panos", "palo_alto"}
-    _F5_INDICATORS = {"f5", "bigip"}
 
     def __init__(
         self,
@@ -85,19 +89,11 @@ class NextHopDiscoveryStep:
                 return cached
             raise NextHopDiscoveryError(cached)
 
-        # Check if device is Palo Alto based on platform_slug or platform_name
-        platform_slug_lower = (device.platform_slug or "").lower()
-        platform_name_lower = (device.platform_name or "").lower()
-        is_palo_alto = any(
-            indicator in platform_slug_lower or indicator in platform_name_lower
-            for indicator in self._PALO_ALTO_INDICATORS
-        )
-        is_f5 = any(
-            indicator in platform_slug_lower or indicator in platform_name_lower
-            for indicator in self._F5_INDICATORS
-        )
+        # Determine platform handling
+        platform_is_palo_alto = is_palo_alto(device)
+        platform_is_f5 = is_f5_bigip(device)
 
-        if is_palo_alto:
+        if platform_is_palo_alto:
             if self._logger:
                 self._logger.info(
                     f"Detected Palo Alto device '{device.name}' (platform: {device.platform_slug or device.platform_name})",
@@ -110,7 +106,7 @@ class NextHopDiscoveryStep:
             except NextHopDiscoveryError as exc:
                 self._cache[cache_key] = str(exc)
                 raise
-        elif is_f5:
+        elif platform_is_f5:
             if self._logger:
                 self._logger.info(
                     f"Detected F5 BIG-IP device '{device.name}' (platform: {device.platform_slug or device.platform_name})",
@@ -270,10 +266,10 @@ class NextHopDiscoveryStep:
         if not napalm_settings:
             raise NextHopDiscoveryError("NAPALM credentials not configured (set NAPALM_USERNAME and NAPALM_PASSWORD)")
 
-        driver_name = self._select_napalm_driver(device)
+        driver_name = select_napalm_driver(device)
         last_error: Optional[Exception] = None
 
-        for candidate in self._driver_attempts(driver_name):
+        for candidate in napalm_driver_attempts(driver_name):
             try:
                 driver = napalm.get_network_driver(candidate)
                 if self._logger:
@@ -282,14 +278,14 @@ class NextHopDiscoveryStep:
                         extra={"grouping": "next-hop-discovery"},
                     )
 
-                optional_args = self._optional_args_for(candidate)
+                optional_args = napalm_optional_args(candidate)
                 with driver(
                     hostname=device.primary_ip,
                     username=napalm_settings.username,
                     password=napalm_settings.password,
                     optional_args=optional_args,
                 ) as device_conn:
-                    if candidate in self._NXOS_DRIVERS:
+                    if candidate in nxos_drivers():
                         next_hops = self._collect_nxos_routes(device_conn, destination_ip, ingress_if)
                         details = f"Resolved via NX-OS CLI on '{device.name}'"
                     else:
@@ -318,72 +314,6 @@ class NextHopDiscoveryStep:
                 continue
 
         raise NextHopDiscoveryError(f"NAPALM lookup failed for '{device.name}': {last_error}")
-
-    def _driver_attempts(self, initial: str) -> List[str]:
-        """Order the NAPALM driver names to try, with fallbacks.
-
-        Args:
-            initial: Initial driver name to try.
-
-        Returns:
-            List of driver names to attempt.
-        """
-        attempts = [initial]
-        if initial == "nxos":
-            attempts.append("nxos_ssh")
-        elif initial == "nxos_ssh":
-            attempts.append("nxos")
-        return attempts
-
-    @staticmethod
-    def _optional_args_for(driver_name: str) -> dict:
-        """Return driver-specific optional arguments for NAPALM.
-
-        Args:
-            driver_name: Name of the NAPALM driver.
-
-        Returns:
-            Dictionary of optional arguments.
-        """
-        if driver_name == "nxos":
-            return {"port": 443, "verify": False}
-        if driver_name == "nxos_ssh":
-            return {"port": 22}
-        if driver_name in {"ios", "eos", "junos", "arista_eos", "cisco_ios"}:
-            return {"port": 22}
-        return {}
-
-    def _select_napalm_driver(self, device: DeviceRecord) -> str:
-        """Determine the appropriate NAPALM driver name for a device.
-
-        Args:
-            device: Device record from Nautobot.
-
-        Returns:
-            NAPALM driver name (defaults to 'ios' if unknown).
-        """
-        driver_map = {
-            "ios": "ios",
-            "cisco_ios": "ios",
-            "nxos": "nxos",
-            "nxos_ssh": "nxos_ssh",
-            "cisco_nxos": "nxos",
-            "eos": "eos",
-            "arista_eos": "eos",
-            "junos": "junos",
-        }
-
-        if device.napalm_driver:
-            normalized = device.napalm_driver.lower()
-            return driver_map.get(normalized, device.napalm_driver)
-
-        for candidate in (device.platform_slug, device.platform_name):
-            if isinstance(candidate, str):
-                normalized = candidate.lower()
-                if normalized in driver_map:
-                    return driver_map[normalized]
-
-        return "ios"
 
     @staticmethod
     def _collect_generic_routes(device_conn, destination_ip: str) -> List[dict]:

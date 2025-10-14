@@ -140,6 +140,32 @@ class F5Client:
     def get_static_routes(self) -> Dict[str, object]:
         return self._get("/tm/net/route")
 
+    def get_interface_stats(
+        self,
+        interfaces: Sequence[str],
+        *,
+        partitions: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Dict[str, object]]:
+        """Return per-interface statistics using the BIG-IP REST API."""
+        stats: Dict[str, Dict[str, object]] = {}
+        for iface in interfaces:
+            for token in _format_interface_tokens(iface, partitions):
+                try:
+                    payload = self._get(f"/tm/net/interface/{token}/stats")
+                except requests.RequestException:
+                    continue
+                entries = payload.get("entries") if isinstance(payload, dict) else None
+                if not entries:
+                    continue
+                nested = next(iter(entries.values()), {}).get("nestedStats", {}).get("entries", {})
+                if not nested:
+                    continue
+                stats[iface] = _transform_f5_interface_entries(nested)
+                break
+            else:
+                stats.setdefault(iface, {})
+        return stats
+
     # ---- High-level orchestration --------------------------------------
 
     def collect_destination_summary(
@@ -475,6 +501,94 @@ def _choose_egress_vlan_and_self(
     floating = [entry for entry in candidates if entry["floating"]]
     best = floating[0] if floating else candidates[0]
     return vlan, best
+
+
+def _format_interface_tokens(name: str, partitions: Optional[Sequence[str]]) -> List[str]:
+    """Return potential REST tokens for the supplied interface name."""
+    tokens: List[str] = []
+    stripped = name.strip()
+    if not stripped:
+        return tokens
+    if stripped.startswith("~"):
+        tokens.append(stripped)
+    elif stripped.startswith("/"):
+        parts = stripped.strip("/").split("/")
+        if len(parts) >= 2:
+            partition = parts[-2]
+            iface = parts[-1]
+            tokens.append(f"~{partition}~{iface}")
+    else:
+        tokens.append(f"~Common~{stripped}")
+        if partitions:
+            for partition in partitions:
+                if partition and partition != "Common":
+                    tokens.append(f"~{partition}~{stripped}")
+    # Ensure uniqueness while preserving order
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    return ordered if ordered else [stripped]
+
+
+def _transform_f5_interface_entries(entries: Dict[str, object]) -> Dict[str, object]:
+    """Flatten nestedStats entries into a simpler dictionary."""
+
+    def entry_value(key: str) -> Optional[object]:
+        item = entries.get(key)
+        if isinstance(item, dict):
+            if "value" in item:
+                return item["value"]
+            if "description" in item:
+                return item["description"]
+        return None
+
+    counters_entries = {}
+    counters_raw = entries.get("counters")
+    if isinstance(counters_raw, dict):
+        counters_entries = counters_raw.get("nestedStats", {}).get("entries", {}) or {}
+
+    def counter_value(key: str) -> Optional[int]:
+        item = counters_entries.get(key, {})
+        if isinstance(item, dict):
+            raw = item.get("value", item.get("description"))
+        else:
+            raw = None
+        return _safe_int(raw)
+
+    bits_in = counter_value("bitsIn")
+    bits_out = counter_value("bitsOut")
+
+    return {
+        "mac_address": entry_value("macAddress"),
+        "mtu": _safe_int(entry_value("mtu")),
+        "speed_mbps": _safe_int(entry_value("speed")),
+        "admin_state": entry_value("enabledState") or entry_value("requestedState"),
+        "oper_state": entry_value("status") or entry_value("linkStatus"),
+        "counters": {
+            "rx_bytes": bits_in // 8 if isinstance(bits_in, int) else None,
+            "tx_bytes": bits_out // 8 if isinstance(bits_out, int) else None,
+            "rx_errors": counter_value("errorsIn"),
+            "tx_errors": counter_value("errorsOut"),
+            "rx_discards": counter_value("dropsIn"),
+            "tx_discards": counter_value("dropsOut"),
+        },
+    }
+
+
+def _safe_int(value: object) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.replace(",", ""))
+        except ValueError:
+            return None
+    return None
 
 
 __all__ = ["F5APIError", "F5Client", "F5NextHopSummary"]

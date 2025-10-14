@@ -1,7 +1,13 @@
 """Core package for modular network path tracing components."""
 
 from .config import NautobotAPISettings, NetworkPathSettings, PaloAltoSettings, NapalmSettings, F5Settings
-from .exceptions import GatewayDiscoveryError, InputValidationError, NextHopDiscoveryError, PathTracingError
+from .exceptions import (
+    GatewayDiscoveryError,
+    InputValidationError,
+    NextHopDiscoveryError,
+    PathTracingError,
+    InterfaceStatsError,
+)
 from .interfaces.nautobot import (
     IPAddressRecord,
     PrefixRecord,
@@ -12,6 +18,7 @@ from .interfaces.nautobot import (
 )
 from .interfaces.nautobot_api import NautobotAPIDataSource
 from .interfaces.nautobot_orm import NautobotORMDataSource
+from .interfaces.interface_stats import InterfaceStats, InterfaceStatsService
 from .interfaces.palo_alto import PaloAltoClient
 from .interfaces.f5_bigip import F5Client, F5NextHopSummary, F5APIError
 from .steps.gateway_discovery import GatewayDiscoveryResult, GatewayDiscoveryStep
@@ -31,12 +38,15 @@ __all__ = [
     "GatewayDiscoveryError",
     "NextHopDiscoveryError",
     "PathTracingError",
+    "InterfaceStatsError",
     "IPAddressRecord",
     "PrefixRecord",
     "DeviceRecord",
     "NautobotDataSource",
     "RedundancyMember",
     "RedundancyResolution",
+    "InterfaceStats",
+    "InterfaceStatsService",
     "NautobotAPIDataSource",
     "NautobotORMDataSource",
     "PaloAltoClient",
