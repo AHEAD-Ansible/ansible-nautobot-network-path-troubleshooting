@@ -1,5 +1,0 @@
----
-# Shared defaults for Nautobot lookup role.
-nautobot_lookup_num_retries: 3
-nautobot_lookup_validate_certs: "{{ nautobot_validate_certs | default(false) }}"
-nautobot_lookup_default_depth: "{{ nautobot_depth | default(none) }}"
