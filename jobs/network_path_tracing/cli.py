@@ -8,6 +8,7 @@ import sys
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Dict, Optional
+import ipaddress
 
 from .config import NapalmSettings, NetworkPathSettings, _DEFAULT_DESTINATION_IP, _DEFAULT_SOURCE_IP
 from .exceptions import (
@@ -27,6 +28,7 @@ from .steps import (
     PathHop,
     Path as TracedPath,
 )
+from .utils import resolve_target_to_ipv4
 
 
 def _hop_to_payload(hop: PathHop) -> Dict[str, Any]:
@@ -83,12 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-ip",
         default=_DEFAULT_SOURCE_IP,
-        help=f"Source IP address (default: {_DEFAULT_SOURCE_IP})",
+        help=f"Source IP address or hostname (default: {_DEFAULT_SOURCE_IP})",
     )
     parser.add_argument(
         "--destination-ip",
         default=_DEFAULT_DESTINATION_IP,
-        help=f"Destination IP address (default: {_DEFAULT_DESTINATION_IP})",
+        help=f"Destination IP address or hostname (default: {_DEFAULT_DESTINATION_IP})",
     )
     parser.add_argument(
         "--visualize-html",
@@ -140,8 +142,26 @@ def run_steps(
     """Execute the full workflow and return a JSON-serializable payload."""
     base_settings = settings or NetworkPathSettings()
 
-    effective_source_ip = source_ip or base_settings.source_ip
-    effective_destination_ip = destination_ip or base_settings.destination_ip
+    source_input = (source_ip if source_ip is not None else base_settings.source_ip).strip()
+    destination_input = (destination_ip if destination_ip is not None else base_settings.destination_ip).strip()
+
+    resolved_source_ip = resolve_target_to_ipv4(source_input, "source")
+    resolved_destination_ip = resolve_target_to_ipv4(destination_input, "destination")
+
+    source_candidate = source_input.split("/")[0].strip()
+    destination_candidate = destination_input.split("/")[0].strip()
+
+    if source_candidate and source_candidate != resolved_source_ip:
+        try:
+            ipaddress.ip_address(source_candidate)
+        except ValueError:
+            print(f"Resolved source hostname '{source_input}' to IPv4 address {resolved_source_ip}")
+
+    if destination_candidate and destination_candidate != resolved_destination_ip:
+        try:
+            ipaddress.ip_address(destination_candidate)
+        except ValueError:
+            print(f"Resolved destination hostname '{destination_input}' to IPv4 address {resolved_destination_ip}")
 
     base_napalm = base_settings.napalm
     effective_napalm = NapalmSettings(
@@ -150,8 +170,8 @@ def run_steps(
     )
 
     settings = NetworkPathSettings(
-        source_ip=effective_source_ip,
-        destination_ip=effective_destination_ip,
+        source_ip=resolved_source_ip,
+        destination_ip=resolved_destination_ip,
         api=base_settings.api,
         gateway_custom_field=base_settings.gateway_custom_field,
         pa=base_settings.pa,
@@ -182,6 +202,7 @@ def run_steps(
     payload = {
         "status": "ok",
         "source": {
+            "input": source_input,
             "address": validation.source_ip,
             "prefix_length": validation.source_record.prefix_length,
             "prefix": validation.source_prefix.prefix,
@@ -214,7 +235,10 @@ def run_steps(
 
     destination_summary = _build_destination_summary(path_result.paths)
     if destination_summary:
+        destination_summary["input"] = destination_input
         payload["destination"] = destination_summary
+    else:
+        payload["destination"] = {"input": destination_input}
 
     if debug:
         payload["debug"] = {

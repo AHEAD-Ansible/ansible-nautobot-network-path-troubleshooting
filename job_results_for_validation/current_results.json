@@ -155,6 +155,7 @@
         }
     ],
     "source": {
+        "input": "10.100.100.100",
         "address": "10.100.100.100",
         "device_name": "Server-1",
         "interface_name": "eth1",
@@ -163,5 +164,8 @@
         "prefix_length": 24
     },
     "status": "success",
+    "destination": {
+        "input": "10.251.0.205"
+    },
     "visualization": "See attached 'network_path_trace.html' for interactive graph."
 }

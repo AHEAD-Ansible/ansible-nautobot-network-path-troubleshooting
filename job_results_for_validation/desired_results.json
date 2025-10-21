@@ -143,6 +143,7 @@
         }
     ],
     "source": {
+        "input": "10.100.100.100",
         "address": "10.100.100.100",
         "device_name": "Server-1",
         "interface_name": "eth1",
@@ -151,6 +152,7 @@
         "prefix_length": 24
     },
     "destination": {
+        "input": "10.251.0.205",
         "address": "10.251.0.205",
         "device_name": "Server-SNAT"
     },

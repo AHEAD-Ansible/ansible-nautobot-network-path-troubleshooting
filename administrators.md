@@ -43,6 +43,9 @@ tests/
    - Normalizes the inputs (`_to_address_string()`), logs startup metadata and
      unexpected kwargs, and instantiates `NetworkPathSettings` from
      `config.py` (capturing the gateway custom field key, API credentials, etc.).
+   - Accepts either IPv4 literals or hostnames for source/destination, resolving
+     hostnames via the Nautobot system resolver (IPv4 only) and preserving the
+     original input alongside the resolved address in the job results.
    - Creates the shared data source (`NautobotORMDataSource`) and the pipeline
      steps (`InputValidationStep`, `GatewayDiscoveryStep`,
      `NextHopDiscoveryStep`, `PathTracingStep`).

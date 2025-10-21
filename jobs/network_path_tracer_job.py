@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from django.core.exceptions import ObjectDoesNotExist, FieldError
-from nautobot.apps.jobs import IPAddressVar, Job, ObjectVar, register_jobs
+from nautobot.apps.jobs import Job, ObjectVar, StringVar, register_jobs
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import CustomField, SecretsGroup
 from nautobot.extras.secrets.exceptions import SecretError
@@ -27,6 +27,7 @@ from network_path_tracing import (  # Changed to absolute import
     Path,
     build_pyvis_network,
 )
+from network_path_tracing.utils import resolve_target_to_ipv4
 
 
 @register_jobs
@@ -50,12 +51,14 @@ class NetworkPathTracerJob(Job):
         field_order = ["source_ip", "destination_ip", "secrets_group"]  # UI form order
         # soft_time_limit / time_limit could be added if long-running
 
-    source_ip = IPAddressVar(
-        description="Source IP Address (e.g., 10.0.0.1)",
+    source_ip = StringVar(
+        label="Source IP or FQDN",
+        description="Source IP address or hostname (e.g., 10.0.0.1 or server01.example.com)",
         required=True,
     )
-    destination_ip = IPAddressVar(
-        description="Destination IP Address (e.g., 4.2.2.1)",
+    destination_ip = StringVar(
+        label="Destination IP or FQDN",
+        description="Destination IP address or hostname (e.g., 4.2.2.1 or app01.example.com)",
         required=True,
     )
 
@@ -88,19 +91,18 @@ class NetworkPathTracerJob(Job):
         Raise exceptions for failures (Nautobot captures tracebacks in JobResult).
         """
         # Log job start
-        self.logger.info(msg=f"Starting network path tracing job for source_ip={source_ip}, destination_ip={destination_ip}")
+        self.logger.info(
+            msg=f"Starting network path tracing job for source_host={source_ip}, destination_host={destination_ip}"
+        )
 
         # Log unexpected kwargs (robustness)
         if kwargs:
             self.logger.warning(msg=f"Unexpected keyword arguments received: {kwargs}")
 
-        # Validate IP addresses (IPAddressVar returns str, but we normalize)
-        try:
-            ipaddress.ip_address(self._to_address_string(source_ip))
-            ipaddress.ip_address(self._to_address_string(destination_ip))
-        except ValueError as exc:
-            self._fail_job(f"Invalid IP address: {exc}")
-            return {}  # Nautobot handles return on failure
+        source_input = (source_ip or "").strip()
+        destination_input = (destination_ip or "").strip()
+        source_candidate = self._to_address_string(source_input)
+        destination_candidate = self._to_address_string(destination_input)
 
         # Retrieve credentials from the selected Secrets Group
         try:
@@ -139,32 +141,38 @@ class NetworkPathTracerJob(Job):
             )
             return {}
 
-        # Initialize settings and override credentials with secrets group values
-        base_settings = NetworkPathSettings(
-            source_ip=self._to_address_string(source_ip),
-            destination_ip=self._to_address_string(destination_ip),
-        )
-        settings = replace(
-            base_settings,
-            pa=replace(base_settings.pa, username=username, password=password),
-            napalm=replace(base_settings.napalm, username=username, password=password),
-            f5=replace(base_settings.f5, username=username, password=password),
-        )
-        self.logger.debug(
-            msg=(
-                f"Normalized settings: source_ip={settings.source_ip}, "
-                f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
-            )
-        )
-
-        # Initialize workflow steps (modular for testability)
-        data_source = NautobotORMDataSource()
-        validation_step = InputValidationStep(data_source)
-        gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
-        next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
-        path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
-
         try:
+            resolved_source_ip = resolve_target_to_ipv4(source_input, "source")
+            resolved_destination_ip = resolve_target_to_ipv4(destination_input, "destination")
+
+            self._log_hostname_resolution("source", source_candidate, resolved_source_ip)
+            self._log_hostname_resolution("destination", destination_candidate, resolved_destination_ip)
+
+            # Initialize settings and override credentials with secrets group values
+            base_settings = NetworkPathSettings(
+                source_ip=resolved_source_ip,
+                destination_ip=resolved_destination_ip,
+            )
+            settings = replace(
+                base_settings,
+                pa=replace(base_settings.pa, username=username, password=password),
+                napalm=replace(base_settings.napalm, username=username, password=password),
+                f5=replace(base_settings.f5, username=username, password=password),
+            )
+            self.logger.debug(
+                msg=(
+                    f"Normalized settings: source_ip={settings.source_ip}, "
+                    f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
+                )
+            )
+
+            # Initialize workflow steps (modular for testability)
+            data_source = NautobotORMDataSource()
+            validation_step = InputValidationStep(data_source)
+            gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
+            next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
+            path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
+
             # Step 1: Validate inputs
             self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
@@ -198,6 +206,7 @@ class NetworkPathTracerJob(Job):
             result_payload = {
                 "status": "success",
                 "source": {
+                    "input": source_input,
                     "address": validation.source_ip,
                     "prefix_length": validation.source_record.prefix_length,
                     "prefix": validation.source_prefix.prefix,
@@ -230,7 +239,10 @@ class NetworkPathTracerJob(Job):
 
             destination_summary = self._build_destination_summary(path_result.paths)
             if destination_summary:
+                destination_summary["input"] = destination_input
                 result_payload["destination"] = destination_summary
+            else:
+                result_payload["destination"] = {"input": destination_input}
 
             if visualization_attached:
                 result_payload["visualization"] = "See attached 'network_path_trace.html' for interactive graph."
@@ -311,3 +323,15 @@ class NetworkPathTracerJob(Job):
                 "device_name": last_hop.device_name,
             }
         return None
+
+    def _log_hostname_resolution(self, label: str, original: str, resolved: str) -> None:
+        """Log when hostname inputs resolve to IPv4 addresses."""
+
+        if not original or original == resolved:
+            return
+        try:
+            ipaddress.ip_address(original)
+        except ValueError:
+            self.logger.info(
+                msg=f"Resolved {label} hostname '{original}' to IPv4 address {resolved}"
+            )
