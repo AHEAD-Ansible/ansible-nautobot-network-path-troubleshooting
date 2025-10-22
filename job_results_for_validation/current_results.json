@@ -156,6 +156,7 @@
     ],
     "source": {
         "input": "10.100.100.100",
+        "found_in_nautobot": true,
         "address": "10.100.100.100",
         "device_name": "Server-1",
         "interface_name": "eth1",
@@ -165,7 +166,8 @@
     },
     "status": "success",
     "destination": {
-        "input": "10.251.0.205"
+        "input": "10.251.0.205",
+        "found_in_nautobot": true
     },
     "visualization": "See attached 'network_path_trace.html' for interactive graph."
 }

@@ -176,7 +176,24 @@ class NetworkPathTracerJob(Job):
             # Step 1: Validate inputs
             self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
+            if not validation.source_found:
+                self.logger.warning(
+                    msg=(
+                        f"Source IP {resolved_source_ip} not found in Nautobot; "
+                        "continuing with prefix-based gateway discovery."
+                    )
+                )
             self.logger.success("Input validation completed successfully")
+
+            destination_record = data_source.get_ip_address(resolved_destination_ip)
+            destination_found = destination_record is not None
+            if not destination_found:
+                self.logger.warning(
+                    msg=(
+                        f"Destination IP {resolved_destination_ip} not found in Nautobot; "
+                        "path tracing will continue without destination metadata."
+                    )
+                )
 
             # Step 2: Locate gateway
             self.logger.info(msg="Starting gateway discovery")
@@ -207,6 +224,7 @@ class NetworkPathTracerJob(Job):
                 "status": "success",
                 "source": {
                     "input": source_input,
+                    "found_in_nautobot": validation.source_found,
                     "address": validation.source_ip,
                     "prefix_length": validation.source_record.prefix_length,
                     "prefix": validation.source_prefix.prefix,
@@ -238,11 +256,13 @@ class NetworkPathTracerJob(Job):
             }
 
             destination_summary = self._build_destination_summary(path_result.paths)
+            destination_payload: Dict[str, Any] = {
+                "input": destination_input,
+                "found_in_nautobot": destination_found,
+            }
             if destination_summary:
-                destination_summary["input"] = destination_input
-                result_payload["destination"] = destination_summary
-            else:
-                result_payload["destination"] = {"input": destination_input}
+                destination_payload.update(destination_summary)
+            result_payload["destination"] = destination_payload
 
             if visualization_attached:
                 result_payload["visualization"] = "See attached 'network_path_trace.html' for interactive graph."

@@ -190,6 +190,17 @@ def run_steps(
     except InputValidationError as exc:
         raise InputValidationError(f"Validation failed: {exc}") from exc
 
+    if not validation.source_found:
+        print(
+            f"Source IP {settings.source_ip} not found in Nautobot; continuing with prefix-based lookup."
+        )
+
+    destination_found = source.get_ip_address(settings.destination_ip) is not None
+    if not destination_found:
+        print(
+            f"Destination IP {settings.destination_ip} not found in Nautobot; proceeding without destination metadata."
+        )
+
     print(f"Running gateway discovery for prefix={validation.source_prefix.prefix}")
     gateway_step = GatewayDiscoveryStep(source, settings.gateway_custom_field)
     gateway = gateway_step.run(validation)
@@ -203,6 +214,7 @@ def run_steps(
         "status": "ok",
         "source": {
             "input": source_input,
+            "found_in_nautobot": validation.source_found,
             "address": validation.source_ip,
             "prefix_length": validation.source_record.prefix_length,
             "prefix": validation.source_prefix.prefix,
@@ -234,11 +246,13 @@ def run_steps(
     }
 
     destination_summary = _build_destination_summary(path_result.paths)
+    destination_payload: Dict[str, Any] = {
+        "input": destination_input,
+        "found_in_nautobot": destination_found,
+    }
     if destination_summary:
-        destination_summary["input"] = destination_input
-        payload["destination"] = destination_summary
-    else:
-        payload["destination"] = {"input": destination_input}
+        destination_payload.update(destination_summary)
+    payload["destination"] = destination_payload
 
     if debug:
         payload["debug"] = {
