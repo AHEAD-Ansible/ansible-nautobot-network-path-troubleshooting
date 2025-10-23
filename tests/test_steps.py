@@ -267,7 +267,8 @@ def test_gateway_fallback_to_lowest_host(prefix_record, source_ip_record):
 
     assert result.method == "lowest_host"
     assert result.gateway == fallback_gateway
-    assert data_source.get_ip_address("10.10.10.1") == fallback_gateway
+    assert "fallback" in (result.details or "").lower()
+    assert "gw-fallback" in (result.details or "")
 
 
 def test_gateway_missing_data_raises(prefix_record, source_ip_record):
@@ -286,8 +287,13 @@ def test_gateway_lowest_host_requires_existing_ip(prefix_record, source_ip_recor
     data_source = FakeDataSource(ip_records={}, prefix_record=prefix_record, gateway_record=None)
     step = GatewayDiscoveryStep(data_source, "network_gateway")
 
-    with pytest.raises(GatewayDiscoveryError):
-        step.run(validation)
+    result = step.run(validation)
+
+    assert result.method == "lowest_host"
+    assert result.gateway.address == "10.10.10.1"
+    assert result.gateway.device_name is None
+    assert "not present" in (result.details or "").lower()
+    assert "fallback" in (result.details or "").lower()
 
 
 def build_validation_result(
