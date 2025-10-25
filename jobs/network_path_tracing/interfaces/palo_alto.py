@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import urllib.parse
 import urllib3
 import requests
 import xml.etree.ElementTree as ET
-from typing import Optional, Dict, Iterable
+from typing import List, Optional, Dict, Iterable
 
 
 def _parse_pan_xml(text: str) -> ET.Element:
@@ -103,6 +104,75 @@ def _extract_next_hop_bundle(root: ET.Element) -> Dict[str, Optional[str]]:
     return {"next_hop": nh, "egress_interface": egress}
 
 
+def _parse_lldp_neighbors(root: ET.Element) -> Dict[str, List[Dict[str, Optional[str]]]]:
+    """Return LLDP neighbors keyed by local interface."""
+
+    neighbors: Dict[str, List[Dict[str, Optional[str]]]] = {}
+    for entry in root.findall(".//entry"):
+        local_if = entry.get("name") or _find_first_text(
+            entry,
+            "./local-interface",
+            ".//local-interface",
+            ".//interface",
+            "./interface",
+            ".//local-port",
+            ".//local",
+        )
+        if not local_if:
+            continue
+        hostname = _find_first_text(
+            entry,
+            "./system-name",
+            ".//system-name",
+            ".//peer-device",
+            ".//device-name",
+            ".//chassis-name",
+            ".//system",
+            ".//remote-system-name",
+        )
+        remote_port = _find_first_text(
+            entry,
+            "./port-id",
+            ".//port-id",
+            ".//remote-port",
+            ".//port",
+            ".//port-description",
+            ".//port-name",
+        )
+        neighbors.setdefault(local_if, []).append(
+            {
+                "hostname": hostname,
+                "port": remote_port,
+                "local_interface": local_if,
+            }
+        )
+    return neighbors
+
+
+def _parse_arp_entries(root: ET.Element) -> List[Dict[str, Optional[str]]]:
+    """Return ARP entries from the provided XML."""
+
+    entries: List[Dict[str, Optional[str]]] = []
+    for entry in root.findall(".//result//entry"):
+        ip_addr = _find_first_text(entry, "./ip", ".//ip")
+        if not ip_addr:
+            continue
+        interface = _find_first_text(entry, "./interface", ".//interface", "./if", ".//if")
+        mac = _find_first_text(entry, "./mac", ".//mac", "./mac-address", ".//mac-address", ".//hwaddr")
+        vlan = _find_first_text(entry, "./vlan", ".//vlan")
+        age = _find_first_text(entry, "./ttl", ".//ttl", "./age", ".//age")
+        entries.append(
+            {
+                "ip": ip_addr,
+                "interface": interface,
+                "mac": mac,
+                "vlan": vlan,
+                "age": age,
+            }
+        )
+    return entries
+
+
 class PaloAltoClient:
     """Client for interacting with Palo Alto devices via API."""
     def __init__(self, host: str, verify_ssl: bool, timeout: int = 10, logger: Optional[logging.Logger] = None):
@@ -182,3 +252,46 @@ class PaloAltoClient:
         cmd = f"<test><routing><route-lookup><virtual-router>{vr}</virtual-router><ip>{ip}</ip></route-lookup></routing></test>"
         root = self.op(api_key, cmd)
         return _extract_next_hop_bundle(root)
+
+    def get_lldp_neighbors(
+        self,
+        api_key: str,
+        interface: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        """Return LLDP neighbors, optionally filtered by interface."""
+
+        if interface:
+            cmd = (
+                "<show><lldp><neighbors>"
+                f"<entry name=\"{interface}\"/>"
+                "</neighbors></lldp></show>"
+            )
+        else:
+            cmd = "<show><lldp><neighbors><all/></neighbors></lldp></show>"
+        root = self.op(api_key, cmd)
+        neighbors = _parse_lldp_neighbors(root)
+        if self.logger:
+            self.logger.debug(
+                "Retrieved LLDP neighbors for Palo Alto device",
+                extra={
+                    "grouping": "next-hop-discovery",
+                    "neighbor_count": sum(len(v) for v in neighbors.values()),
+                },
+            )
+        return neighbors
+
+    def get_arp_table(self, api_key: str) -> List[Dict[str, Optional[str]]]:
+        """Return ARP table entries."""
+
+        cmd = "<show><arp><all/></arp></show>"
+        root = self.op(api_key, cmd)
+        entries = _parse_arp_entries(root)
+        if self.logger:
+            self.logger.debug(
+                "Retrieved ARP table for Palo Alto device",
+                extra={
+                    "grouping": "next-hop-discovery",
+                    "entry_count": len(entries),
+                },
+            )
+        return entries

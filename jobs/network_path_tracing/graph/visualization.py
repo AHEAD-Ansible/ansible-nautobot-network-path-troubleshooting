@@ -39,6 +39,9 @@ def build_pyvis_network(
         title = "<br/>".join(title_lines) if title_lines else label
         color = None
         role = data.get("role")
+        shape = "dot"
+        if role == "layer2":
+            shape = "box"
         if node_id in highlight:
             color = "#ffd166"
         elif role == "source":
@@ -47,7 +50,7 @@ def build_pyvis_network(
             color = "#06d6a0"
         elif role == "destination":
             color = "#ef476f"
-        net.add_node(node_id, label=label, title=title, color=color)
+        net.add_node(node_id, label=label, title=title, color=color, shape=shape)
 
     edge_occurrences: dict[tuple[str, str], int] = {}
 

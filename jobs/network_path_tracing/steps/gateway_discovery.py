@@ -57,11 +57,17 @@ class GatewayDiscoveryStep:
 
         fallback_record = self._fallback_to_lowest_host(validation)
         if fallback_record:
+            original_device = fallback_record.device_name
+            adjusted_record, _, _, members = self._resolve_gateway_via_redundancy(fallback_record)
+            details = "Used lowest usable IP address as the gateway fallback."
+            if members or (not original_device and adjusted_record.device_name):
+                details += " Resolved gateway interface via interface redundancy groups."
             return GatewayDiscoveryResult(
                 found=True,
                 method="lowest_host",
-                gateway=fallback_record,
-                details="Used lowest usable IP address as the gateway fallback.",
+                gateway=adjusted_record,
+                details=details,
+                redundant_members=members,
             )
 
         raise GatewayDiscoveryError(
