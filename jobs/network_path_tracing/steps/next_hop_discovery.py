@@ -12,7 +12,7 @@ import requests
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
-from ..interfaces.palo_alto import PaloAltoClient
+from ..interfaces.palo_alto import PaloAltoClient, _parse_vlan_members
 from ..interfaces.f5_bigip import F5Client, F5APIError
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
@@ -57,6 +57,8 @@ class NextHopDiscoveryStep:
         self._ip_device_cache: Dict[str, Optional[str]] = {}
         self._palo_lldp_cache: Dict[str, Dict[str, List[Dict[str, Optional[str]]]]] = {}
         self._palo_arp_cache: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+        self._palo_mac_cache: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+        self._palo_vlan_member_cache: Dict[str, List[str]] = {}
         self._layer2_helper: Optional[Layer2Discovery] = None
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> NextHopDiscoveryResult:
@@ -94,10 +96,7 @@ class NextHopDiscoveryStep:
         # Check if device is Palo Alto based on platform_slug or platform_name
         platform_slug_lower = (device.platform_slug or "").lower()
         platform_name_lower = (device.platform_name or "").lower()
-        is_palo_alto = any(
-            indicator in platform_slug_lower or indicator in platform_name_lower
-            for indicator in self._PALO_ALTO_INDICATORS
-        )
+        is_palo_alto = self._is_palo_alto_device(device)
         is_f5 = any(
             indicator in platform_slug_lower or indicator in platform_name_lower
             for indicator in self._F5_INDICATORS
@@ -220,6 +219,16 @@ class NextHopDiscoveryStep:
             )
             if hop_type:
                 hop_payload["hop_type"] = hop_type
+            if self._settings.enable_layer2_discovery:
+                layer2_path = self._discover_palo_layer2_path(
+                    client=client,
+                    api_key=api_key,
+                    device=device,
+                    egress_interface=merged.get("egress_interface"),
+                    target_ip=merged.get("next_hop") or destination_ip,
+                )
+                if layer2_path:
+                    hop_payload["layer2_hops"] = layer2_path
 
             return NextHopDiscoveryResult(
                 found=found,
@@ -872,12 +881,39 @@ class NextHopDiscoveryStep:
         if not device_name or not egress_interface or not target_ip:
             return []
 
-        helper = self._build_layer2_helper()
-        if helper is None:
-            return []
-
         device = self._data_source.get_device(device_name)
         if not device or not device.primary_ip:
+            return []
+
+        if self._is_palo_alto_device(device):
+            pa_settings = self._settings.pa_settings()
+            if pa_settings is None:
+                return []
+            client = PaloAltoClient(
+                host=device.primary_ip,
+                verify_ssl=pa_settings.verify_ssl,
+                timeout=10,
+                logger=self._logger,
+            )
+            try:
+                api_key = client.keygen(pa_settings.username, pa_settings.password)
+            except RuntimeError as exc:
+                if self._logger:
+                    self._logger.debug(
+                        f"Palo Alto keygen failed for '{device.name}': {exc}",
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                return []
+            return self._discover_palo_layer2_path(
+                client=client,
+                api_key=api_key,
+                device=device,
+                egress_interface=egress_interface,
+                target_ip=target_ip,
+            )
+
+        helper = self._build_layer2_helper()
+        if helper is None:
             return []
 
         napalm_settings = self._settings.napalm_settings()
@@ -944,6 +980,172 @@ class NextHopDiscoveryStep:
         )
         self._layer2_helper = helper
         return helper
+
+    def _discover_palo_layer2_path(
+        self,
+        *,
+        client: PaloAltoClient,
+        api_key: str,
+        device: DeviceRecord,
+        egress_interface: Optional[str],
+        target_ip: Optional[str],
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return serialized layer-2 hops derived from Palo Alto LLDP/ARP data."""
+
+        if not self._settings.enable_layer2_discovery:
+            return []
+        if self._settings.layer2_max_depth <= 0:
+            return []
+        if not egress_interface or not target_ip:
+            return []
+        egress_norm = self._normalize_interface(egress_interface)
+        if not egress_norm:
+            return []
+
+        neighbors = self._get_palo_lldp_neighbors(client, api_key, device.name)
+
+        arp_table = self._get_palo_arp_table(client, api_key, device.name)
+        arp_entry = arp_table.get(target_ip)
+        if not arp_entry:
+            return []
+        mac_addr = (arp_entry.get("mac") or arp_entry.get("mac_address") or "").strip()
+        if not mac_addr:
+            return []
+        mac_addr_norm = mac_addr.upper()
+
+        arp_if_norm = self._normalize_interface(arp_entry.get("interface"))
+
+        if arp_if_norm and arp_if_norm == egress_norm:
+            if "vlan" not in egress_norm:
+                if self._logger:
+                    self._logger.debug(
+                        "Skipping Palo Alto layer-2 discovery on %s; egress %s matches ARP interface %s",
+                        device.name,
+                        egress_interface,
+                        arp_entry.get("interface"),
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                return []
+
+        interfaces_to_query: List[str] = []
+        interface_aliases: Dict[str, str] = {}
+
+        def _add_interface(alias: Optional[str]) -> None:
+            if not alias:
+                return
+            norm = self._normalize_interface(alias)
+            if not norm:
+                return
+            if norm not in interface_aliases:
+                interface_aliases[norm] = alias
+            if norm not in interfaces_to_query:
+                interfaces_to_query.append(norm)
+
+        _add_interface(egress_interface)
+        if arp_if_norm and arp_entry.get("interface"):
+            _add_interface(arp_entry.get("interface"))
+        elif arp_if_norm:
+            _add_interface(arp_if_norm)
+
+        if egress_norm and "vlan" in egress_norm:
+            vlan_members = self._get_palo_vlan_members(
+                client=client,
+                api_key=api_key,
+                device_name=device.name,
+                vlan_interface=egress_interface,
+            )
+            for member in vlan_members:
+                _add_interface(member)
+            if self._logger and vlan_members:
+                self._logger.debug(
+                    "Augmented VLAN interface %s with members %s for %s",
+                    egress_interface,
+                    vlan_members,
+                    device.name,
+                    extra={"grouping": "layer2-discovery"},
+                )
+
+        chosen_neighbors: Optional[List[Dict[str, Optional[str]]]] = None
+        for iface in interfaces_to_query:
+            if not iface:
+                continue
+            candidate_list = neighbors.get(iface)
+            if candidate_list:
+                chosen_neighbors = candidate_list
+                break
+        if chosen_neighbors is None:
+            if self._logger:
+                self._logger.debug(
+                    "No LLDP neighbors match interfaces %s on %s",
+                    interfaces_to_query,
+                    device.name,
+                    extra={"grouping": "layer2-discovery"},
+                )
+            return []
+
+        neighbor = self._match_lldp_neighbor(chosen_neighbors, target_ip)
+        if not neighbor:
+            neighbor = chosen_neighbors[0]
+        if not neighbor:
+            return []
+
+        neighbor_name = neighbor.get("hostname")
+        if not neighbor_name:
+            neighbor_name = neighbor.get("port") or f"layer2-neighbor-{device.name}"
+        neighbor_name = str(neighbor_name)
+
+        mac_table = self._get_palo_mac_table(client, api_key, device.name)
+        mac_entry = mac_table.get(mac_addr.upper())
+        mac_interfaces_norm: List[str] = []
+        if mac_entry:
+            mac_interface_raw = mac_entry.get("interface")
+            _add_interface(mac_interface_raw)
+            mac_interface = self._normalize_interface(mac_interface_raw)
+            if mac_interface:
+                mac_interfaces_norm.append(mac_interface)
+        if "vlan" in egress_norm:
+            mac_interfaces_norm.extend(interfaces_to_query)
+        if mac_entry and mac_interfaces_norm:
+            if not any(iface in interfaces_to_query for iface in mac_interfaces_norm if iface):
+                mac_entry = None
+
+        ingress_on_neighbor = neighbor.get("port")
+        if ingress_on_neighbor and ingress_on_neighbor.isdigit():
+            ingress_on_neighbor = None
+        if not ingress_on_neighbor:
+            ingress_on_neighbor = neighbor.get("port_description") or neighbor.get("port")
+        egress_on_neighbor = None
+        if mac_entry and mac_entry.get("interface"):
+            egress_norm_candidate = self._normalize_interface(mac_entry.get("interface"))
+            egress_on_neighbor = interface_aliases.get(egress_norm_candidate, mac_entry.get("interface"))
+        if not egress_on_neighbor and interfaces_to_query:
+            first_norm = interfaces_to_query[0]
+            egress_on_neighbor = interface_aliases.get(first_norm, first_norm)
+
+        details = (
+            f"Layer 2 hop resolved via LLDP/MAC on '{neighbor_name or 'unknown'}' "
+            f"(MAC {mac_addr_norm})."
+        )
+
+        if self._logger:
+            self._logger.debug(
+                "Derived Palo Alto layer-2 hop: device=%s ingress=%s egress=%s mac=%s",
+                neighbor_name,
+                ingress_on_neighbor,
+                egress_on_neighbor,
+                mac_addr_norm,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        return [
+            {
+                "device_name": neighbor_name,
+                "ingress_interface": ingress_on_neighbor,
+                "egress_interface": egress_on_neighbor,
+                "mac_address": mac_addr_norm,
+                "details": details,
+            }
+        ]
 
     def _classify_palo_alto_hop(
         self,
@@ -1028,6 +1230,81 @@ class NextHopDiscoveryStep:
         self._palo_lldp_cache[cache_key] = normalized
         return normalized
 
+    def _get_palo_mac_table(
+        self,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Return cached MAC address table entries keyed by MAC."""
+
+        cache_key = f"{device_name}::mac"
+        cached = self._palo_mac_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            entries = client.get_mac_table(api_key)
+        except RuntimeError as exc:
+            entries = []
+            if self._logger:
+                self._logger.debug(
+                    f"Palo Alto MAC retrieval failed for '{device_name}': {exc}",
+                    extra={"grouping": "layer2-discovery"},
+                )
+
+        table: Dict[str, Dict[str, Optional[str]]] = {}
+        for entry in entries or []:
+            mac = entry.get("mac")
+            if not mac:
+                continue
+            table[mac.upper()] = {
+                "mac": mac,
+                "interface": entry.get("interface"),
+                "vlan": entry.get("vlan"),
+                "age": entry.get("age"),
+            }
+
+        self._palo_mac_cache[cache_key] = table
+        return table
+
+    def _get_palo_vlan_members(
+        self,
+        *,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+        vlan_interface: str,
+    ) -> List[str]:
+        """Return member interfaces for the VLAN carrying ``vlan_interface``."""
+
+        cache_key = f"{device_name}::vlan::{vlan_interface}"
+        cached = self._palo_vlan_member_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        members = client.vlan_members_for_interface(api_key, vlan_interface)
+        if not members:
+            vlan_iface_norm = self._normalize_interface(vlan_interface) or vlan_interface.lower()
+            iface_token = vlan_iface_norm.replace("vlan.", "").replace("vlan-", "")
+            for candidate in (iface_token, f"vlan.{iface_token}", f"vlan-{iface_token}"):
+                if candidate == vlan_interface or not candidate:
+                    continue
+                members = client.vlan_members_for_interface(api_key, candidate)
+                if members:
+                    break
+
+        if not members and self._logger:
+            self._logger.debug(
+                "VLAN member lookup failed for '%s' interface '%s'",
+                device_name,
+                vlan_interface,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        self._palo_vlan_member_cache[cache_key] = members
+        return members
+
     def _get_palo_arp_table(
         self,
         client: PaloAltoClient,
@@ -1103,6 +1380,16 @@ class NextHopDiscoveryStep:
         device_name = device_record.device_name if device_record else None
         self._ip_device_cache[ip_addr] = device_name
         return device_name
+
+    def _is_palo_alto_device(self, device: DeviceRecord) -> bool:
+        """Return True if ``device`` appears to be a Palo Alto platform."""
+
+        for candidate in (device.platform_slug, device.platform_name):
+            if isinstance(candidate, str):
+                token = candidate.lower()
+                if any(indicator in token for indicator in self._PALO_ALTO_INDICATORS):
+                    return True
+        return False
 
     @staticmethod
     def _normalize_hostname(name: Optional[str]) -> Optional[str]:
