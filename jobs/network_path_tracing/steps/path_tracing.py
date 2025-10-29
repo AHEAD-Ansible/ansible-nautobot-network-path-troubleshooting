@@ -52,6 +52,13 @@ class PathTracingResult:
 
 
 @dataclass
+class DeviceNodeAssignment:
+    """Track node usage within a single path for duplicate control."""
+    node_id: str
+    last_index: int
+
+
+@dataclass
 class TraceState:
     """BFS traversal state for graph-based path tracing."""
     device_name: Optional[str]
@@ -62,6 +69,7 @@ class TraceState:
     failed_hops: int = 0
     visited: Set[Tuple[str, str]] = field(default_factory=set)  # Changed to track (device, interface) for intra-device handling
     graph_node_id: Optional[str] = None
+    device_nodes: Dict[str, List[DeviceNodeAssignment]] = field(default_factory=dict)
 
 
 class PathTracingStep:
@@ -208,10 +216,13 @@ class PathTracingStep:
         visited = set(state.visited)
         visited.add(visited_key)
 
-        node_id = state.graph_node_id
-        if not node_id:
-            node_id = self._node_id_for_device(device_name)
-            state.graph_node_id = node_id
+        device_nodes = state.device_nodes
+        node_id = self._node_id_for_device(
+            device_name,
+            device_nodes=device_nodes,
+            path_index=len(current_hops),
+        )
+        state.graph_node_id = node_id
 
         # Check if current device is the destination
         dest_record = self._data_source.get_ip_address(destination_ip)
@@ -303,6 +314,7 @@ class PathTracingStep:
             branch_issues = list(path_issues)
             branch_failed_hops = state.failed_hops
             graph_source_node_id = node_id
+            branch_device_nodes = self._clone_device_nodes(device_nodes)
 
             next_hop_ip = next_hop.get("next_hop_ip")
             egress_interface = next_hop.get("egress_interface")
@@ -332,6 +344,8 @@ class PathTracingStep:
                         graph,
                         graph_source_node_id,
                         l2_payloads_for_branch,
+                        branch_device_nodes,
+                        display_egress,
                     )
                     graph_source_node_id = self._append_destination_layer2(
                         branch_hops,
@@ -340,8 +354,10 @@ class PathTracingStep:
                         device_name,
                         display_egress,
                         destination_ip,
+                        branch_device_nodes,
                     )
-                    self._finalize_path(branch_hops, branch_issues, reached=True)
+                    destination_hop = self._build_destination_hop(destination_ip)
+                    edge_egress = self._edge_egress_value(branch_hops, destination_hop, display_egress)
 
                     dest_node_id = self._node_id_for_destination(device_name, destination_ip)
                     graph.mark_destination(
@@ -355,9 +371,14 @@ class PathTracingStep:
                     graph.add_edge(
                         graph_source_node_id,
                         dest_node_id,
+                        hop=destination_hop or hop_entry,
                         local_route=True,
                         details=hop_entry.details,
+                        egress_interface=edge_egress,
                     )
+                    if destination_hop:
+                        branch_hops.append(destination_hop)
+                    self._finalize_path(branch_hops, branch_issues, reached=True)
                     continue
                 if self._is_destination_on_interface(device_name, display_egress, destination_ip):
                     hop_entry = PathHop(
@@ -375,6 +396,8 @@ class PathTracingStep:
                         graph,
                         graph_source_node_id,
                         layer2_payloads,
+                        branch_device_nodes,
+                        display_egress,
                     )
                     layer2_payloads = []
                     graph_source_node_id = self._append_destination_layer2(
@@ -384,12 +407,14 @@ class PathTracingStep:
                         device_name,
                         display_egress,
                         destination_ip,
+                        branch_device_nodes,
                     )
                     destination_hop = self._build_destination_hop(destination_ip)
                     dest_node_id = self._node_id_for_destination(
                         destination_hop.device_name if destination_hop else None,
                         destination_ip,
                     )
+                    edge_egress = self._edge_egress_value(branch_hops, destination_hop, display_egress)
                     graph.mark_destination(
                         graph.ensure_node(
                             dest_node_id,
@@ -402,9 +427,9 @@ class PathTracingStep:
                     graph.add_edge(
                         graph_source_node_id,
                         dest_node_id,
-                        hop=hop_entry,
+                        hop=destination_hop or hop_entry,
                         next_hop_ip=destination_ip,
-                        egress_interface=display_egress,
+                        egress_interface=edge_egress,
                         details=hop_entry.details,
                     )
                     if destination_hop:
@@ -427,6 +452,8 @@ class PathTracingStep:
                     graph,
                     graph_source_node_id,
                     layer2_payloads,
+                    branch_device_nodes,
+                    display_egress,
                 )
                 layer2_payloads = []
                 self._record_issue(branch_issues, aggregate_issues, "Routing blackhole detected.")
@@ -461,6 +488,8 @@ class PathTracingStep:
                     graph,
                     graph_source_node_id,
                     layer2_payloads,
+                    branch_device_nodes,
+                    display_egress,
                 )
                 layer2_payloads = []
                 graph_source_node_id = self._append_destination_layer2(
@@ -470,9 +499,11 @@ class PathTracingStep:
                     device_name,
                     display_egress,
                     destination_ip,
+                    branch_device_nodes,
                 )
                 destination_hop = self._build_destination_hop(destination_ip)
                 dest_node_id = self._node_id_for_destination(destination_hop.device_name, destination_ip)
+                edge_egress = self._edge_egress_value(branch_hops, destination_hop, display_egress)
                 graph.mark_destination(
                     graph.ensure_node(
                         dest_node_id,
@@ -485,9 +516,9 @@ class PathTracingStep:
                 graph.add_edge(
                     graph_source_node_id,
                     dest_node_id,
-                    hop=hop_entry,
+                    hop=destination_hop or hop_entry,
                     next_hop_ip=next_hop_ip,
-                    egress_interface=display_egress,
+                    egress_interface=edge_egress,
                     details=next_hop_result.details,
                 )
                 if destination_hop:
@@ -501,6 +532,8 @@ class PathTracingStep:
                 device_name=next_device_name,
                 next_hop_ip=next_hop_ip,
                 egress_interface=display_egress,
+                device_nodes=branch_device_nodes,
+                path_index=len(branch_hops),
             )
 
             graph.ensure_node(
@@ -521,6 +554,8 @@ class PathTracingStep:
                 graph,
                 graph_source_node_id,
                 layer2_payloads,
+                branch_device_nodes,
+                display_egress,
             )
             layer2_payloads = []
 
@@ -715,6 +750,37 @@ class PathTracingStep:
             container.append(value)
 
     @staticmethod
+    def _edge_egress_value(
+        branch_hops: List[PathHop],
+        destination_hop: Optional[PathHop],
+        fallback: Optional[str],
+    ) -> Optional[str]:
+        """Return the interface label to apply to the rendered edge."""
+
+        for hop in reversed(branch_hops):
+            if hop.hop_type == "layer2" and hop.egress_interface:
+                return hop.egress_interface
+        if fallback:
+            return fallback
+        if destination_hop and destination_hop.interface_name:
+            return destination_hop.interface_name
+        return None
+
+    @staticmethod
+    def _clone_device_nodes(
+        mapping: Dict[str, List[DeviceNodeAssignment]]
+    ) -> Dict[str, List[DeviceNodeAssignment]]:
+        """Deep-copy the device node assignment map for branch exploration."""
+
+        cloned: Dict[str, List[DeviceNodeAssignment]] = {}
+        for device, assignments in mapping.items():
+            cloned[device] = [
+                DeviceNodeAssignment(node_id=entry.node_id, last_index=entry.last_index)
+                for entry in assignments
+            ]
+        return cloned
+
+    @staticmethod
     def _as_layer3_hop_type(hop_type: Optional[str]) -> str:
         """Ensure primary hops default to at least layer3."""
 
@@ -732,20 +798,54 @@ class PathTracingStep:
         device_name: Optional[str],
         egress_interface: Optional[str],
         destination_ip: str,
+        device_nodes: Dict[str, List[DeviceNodeAssignment]],
     ) -> str:
         """Append layer-2 hops between the last L3 hop and the destination."""
 
         discover = getattr(self._next_hop_step, "discover_layer2_path", None)
         if not callable(discover):
             return source_node_id
+
+        start_device = device_name
+        start_interface = egress_interface
+        if branch_hops:
+            last_hop = branch_hops[-1]
+            if last_hop.hop_type == "layer2":
+                start_device = last_hop.device_name or start_device
+                start_interface = last_hop.egress_interface or start_interface
+
+        if not start_device or not destination_ip:
+            return source_node_id
+
         payloads = discover(
-            device_name=device_name,
-            egress_interface=egress_interface,
+            device_name=start_device,
+            egress_interface=start_interface,
             target_ip=destination_ip,
         ) or []
+
+        if branch_hops and payloads:
+            last_layer2 = branch_hops[-1]
+            if last_layer2.hop_type == "layer2":
+                payloads = [
+                    p
+                    for p in payloads
+                    if not (
+                        p.get("device_name") == last_layer2.device_name
+                        and p.get("ingress_interface") == last_layer2.ingress_interface
+                        and p.get("egress_interface") == last_layer2.egress_interface
+                    )
+                ]
+
         if not payloads:
             return source_node_id
-        return self._append_layer2_hops(branch_hops, graph, source_node_id, payloads)
+        return self._append_layer2_hops(
+            branch_hops,
+            graph,
+            source_node_id,
+            payloads,
+            device_nodes,
+            start_interface,
+        )
 
     def _matches_destination_gateway_device(self, device_name: Optional[str]) -> bool:
         """Return True if the current device matches the resolved destination gateway."""
@@ -797,8 +897,18 @@ class PathTracingStep:
 
         source_node_id = state.graph_node_id
         if not source_node_id:
-            source_node_id = self._node_id_for_device(device_name)
+            source_node_id = self._node_id_for_device(
+                device_name,
+                device_nodes=state.device_nodes,
+                path_index=len(branch_hops) - 1,
+            )
             state.graph_node_id = source_node_id
+        else:
+            self._node_id_for_device(
+                device_name,
+                device_nodes=state.device_nodes,
+                path_index=len(branch_hops) - 1,
+            )
         graph.ensure_node(
             source_node_id,
             label=device_name,
@@ -817,6 +927,7 @@ class PathTracingStep:
             device_name,
             egress_interface,
             destination_ip,
+            state.device_nodes,
         )
         state.graph_node_id = source_node_id
 
@@ -825,6 +936,7 @@ class PathTracingStep:
             destination_hop.device_name if destination_hop else None,
             destination_ip,
         )
+        edge_egress = self._edge_egress_value(branch_hops, destination_hop, egress_interface)
         graph.mark_destination(
             graph.ensure_node(
                 dest_node_id,
@@ -837,9 +949,9 @@ class PathTracingStep:
         graph.add_edge(
             source_node_id,
             dest_node_id,
-            hop=hop_entry,
+            hop=destination_hop or hop_entry,
             next_hop_ip=destination_ip,
-            egress_interface=egress_interface,
+            egress_interface=edge_egress,
             details=hop_entry.details,
         )
         if destination_hop:
@@ -908,6 +1020,8 @@ class PathTracingStep:
         graph: NetworkPathGraph,
         source_node_id: str,
         layer2_payloads: List[Dict[str, Any]],
+        device_nodes: Dict[str, List[DeviceNodeAssignment]],
+        upstream_egress: Optional[str],
     ) -> str:
         """Append layer-2 hops to the path and graph, returning last node id."""
 
@@ -935,7 +1049,11 @@ class PathTracingStep:
 
             device_name = layer2_hop.device_name
             if device_name:
-                node_id = self._node_id_for_device(device_name)
+                node_id = self._node_id_for_device(
+                    device_name,
+                    device_nodes=device_nodes,
+                    path_index=len(branch_hops) - 1,
+                )
             else:
                 node_id = self._new_node_id("layer2-hop")
             graph.ensure_node(
@@ -950,15 +1068,18 @@ class PathTracingStep:
                     graph.graph.nodes[node_id].setdefault("interfaces", []),
                     layer2_hop.egress_interface,
                 )
+            edge_label = upstream_egress or payload.get("ingress_interface") or payload.get("egress_interface")
             graph.add_edge(
                 current_source,
                 node_id,
                 hop=layer2_hop,
+                egress_interface=edge_label,
                 mac_address=payload.get("mac_address"),
                 details=layer2_hop.details,
                 dashed=True,
             )
             current_source = node_id
+            upstream_egress = layer2_hop.egress_interface
 
         return current_source
 
@@ -1019,13 +1140,46 @@ class PathTracingStep:
         token = (base or "node").replace(" ", "_")
         return f"{token}::{self._node_sequence}"
 
-    def _node_id_for_device(self, device_name: Optional[str], *, stable: bool = False) -> str:
-        """Return a graph node identifier for a device."""
+    def _node_id_for_device(
+        self,
+        device_name: Optional[str],
+        *,
+        stable: bool = False,
+        device_nodes: Optional[Dict[str, List[DeviceNodeAssignment]]] = None,
+        path_index: Optional[int] = None,
+    ) -> str:
+        """Return a graph node identifier, with path-aware duplication control."""
 
-        base = device_name or "unknown-device"
-        if stable:
-            return base
-        return self._new_node_id(base)
+        if not device_name:
+            return self._new_node_id("unknown-device")
+
+        if stable or device_nodes is None:
+            return device_name
+
+        assignments = device_nodes.setdefault(device_name, [])
+        if assignments:
+            last_assignment = assignments[-1]
+            if (
+                path_index is None
+                or last_assignment.last_index == -1
+                or path_index - last_assignment.last_index <= 1
+            ):
+                if path_index is not None:
+                    last_assignment.last_index = path_index
+                return last_assignment.node_id
+
+        if assignments:
+            node_id = self._new_node_id(device_name)
+        else:
+            node_id = device_name
+
+        assignments.append(
+            DeviceNodeAssignment(
+                node_id=node_id,
+                last_index=path_index if path_index is not None else -1,
+            )
+        )
+        return node_id
 
     @staticmethod
     def _node_id_for_destination(device_name: Optional[str], destination_ip: str) -> str:
@@ -1043,11 +1197,17 @@ class PathTracingStep:
         device_name: Optional[str],
         next_hop_ip: Optional[str],
         egress_interface: Optional[str],
+        device_nodes: Dict[str, List[DeviceNodeAssignment]],
+        path_index: int,
     ) -> str:
         """Determine the node id for the next hop candidate."""
 
         if device_name:
-            return self._node_id_for_device(device_name)
+            return self._node_id_for_device(
+                device_name,
+                device_nodes=device_nodes,
+                path_index=path_index,
+            )
         if next_hop_ip:
             base = f"{source_node_id}::ip::{next_hop_ip}"
         elif egress_interface:

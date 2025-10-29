@@ -1047,6 +1047,7 @@ class NextHopDiscoveryStep:
         elif arp_if_norm:
             _add_interface(arp_if_norm)
 
+        vlan_members: List[str] = []
         if egress_norm and "vlan" in egress_norm:
             vlan_members = self._get_palo_vlan_members(
                 client=client,
@@ -1083,6 +1084,59 @@ class NextHopDiscoveryStep:
                 )
             return []
 
+        neighbors_for_helper: Dict[str, List[Dict[str, Optional[str]]]] = {
+            key: list(entries or []) for key, entries in neighbors.items()
+        }
+        if egress_norm and egress_norm not in neighbors_for_helper:
+            neighbors_for_helper[egress_norm] = list(chosen_neighbors)
+        if arp_if_norm and arp_if_norm not in neighbors_for_helper and chosen_neighbors:
+            neighbors_for_helper[arp_if_norm] = list(chosen_neighbors)
+        for member in vlan_members:
+            member_norm = self._normalize_interface(member)
+            if (
+                member_norm
+                and member_norm in neighbors
+                and egress_norm
+                and egress_norm not in neighbors_for_helper
+            ):
+                neighbors_for_helper[egress_norm] = list(neighbors[member_norm])
+
+        layer2_helper = self._build_layer2_helper()
+        napalm_settings = self._settings.napalm_settings()
+
+        if layer2_helper and napalm_settings:
+            class _PaloNapalmAdapter:
+                def __init__(self, arp_rows: List[Dict[str, Optional[str]]]) -> None:
+                    self._arp_rows = list(arp_rows or [])
+
+                def get_arp_table(self) -> List[Dict[str, Optional[str]]]:
+                    return list(self._arp_rows)
+
+                def get_mac_address_table(self) -> List[Dict[str, Optional[str]]]:
+                    return []
+
+            adapter = _PaloNapalmAdapter(list(arp_table.values()))
+            try:
+                hops = layer2_helper.discover(
+                    initial_device=device,
+                    initial_conn=adapter,
+                    initial_driver_name="palo_alto",
+                    initial_lldp_neighbors=neighbors_for_helper,
+                    egress_interface=egress_interface,
+                    next_hop_ip=target_ip,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                if self._logger:
+                    self._logger.debug(
+                        "Palo Alto layer-2 helper failed for %s: %s",
+                        device.name,
+                        exc,
+                        extra={"grouping": "layer2-discovery"},
+                    )
+            else:
+                if hops:
+                    return [hop.as_dict() for hop in hops]
+
         neighbor = self._match_lldp_neighbor(chosen_neighbors, target_ip)
         if not neighbor:
             neighbor = chosen_neighbors[0]
@@ -1096,31 +1150,24 @@ class NextHopDiscoveryStep:
 
         mac_table = self._get_palo_mac_table(client, api_key, device.name)
         mac_entry = mac_table.get(mac_addr.upper())
-        mac_interfaces_norm: List[str] = []
-        if mac_entry:
-            mac_interface_raw = mac_entry.get("interface")
-            _add_interface(mac_interface_raw)
-            mac_interface = self._normalize_interface(mac_interface_raw)
-            if mac_interface:
-                mac_interfaces_norm.append(mac_interface)
-        if "vlan" in egress_norm:
-            mac_interfaces_norm.extend(interfaces_to_query)
-        if mac_entry and mac_interfaces_norm:
-            if not any(iface in interfaces_to_query for iface in mac_interfaces_norm if iface):
-                mac_entry = None
+        egress_on_neighbor = None
+        if mac_entry and mac_entry.get("interface"):
+            egress_norm_candidate = self._normalize_interface(mac_entry.get("interface"))
+            egress_on_neighbor = interface_aliases.get(egress_norm_candidate, mac_entry.get("interface"))
+
+        if not egress_on_neighbor and self._logger:
+            self._logger.debug(
+                "Palo Alto layer-2 hop missing downstream egress for %s (MAC %s); leaving egress unset",
+                neighbor_name,
+                mac_addr_norm,
+                extra={"grouping": "layer2-discovery"},
+            )
 
         ingress_on_neighbor = neighbor.get("port")
         if ingress_on_neighbor and ingress_on_neighbor.isdigit():
             ingress_on_neighbor = None
         if not ingress_on_neighbor:
             ingress_on_neighbor = neighbor.get("port_description") or neighbor.get("port")
-        egress_on_neighbor = None
-        if mac_entry and mac_entry.get("interface"):
-            egress_norm_candidate = self._normalize_interface(mac_entry.get("interface"))
-            egress_on_neighbor = interface_aliases.get(egress_norm_candidate, mac_entry.get("interface"))
-        if not egress_on_neighbor and interfaces_to_query:
-            first_norm = interfaces_to_query[0]
-            egress_on_neighbor = interface_aliases.get(first_norm, first_norm)
 
         details = (
             f"Layer 2 hop resolved via LLDP/MAC on '{neighbor_name or 'unknown'}' "
@@ -1129,7 +1176,7 @@ class NextHopDiscoveryStep:
 
         if self._logger:
             self._logger.debug(
-                "Derived Palo Alto layer-2 hop: device=%s ingress=%s egress=%s mac=%s",
+                "Derived Palo Alto layer-2 hop (fallback): device=%s ingress=%s egress=%s mac=%s",
                 neighbor_name,
                 ingress_on_neighbor,
                 egress_on_neighbor,
@@ -1217,10 +1264,15 @@ class NextHopDiscoveryStep:
                 continue
             sanitized: List[Dict[str, Optional[str]]] = []
             for entry in entries or []:
+                remote_port = entry.get("port")
+                port_description = entry.get("port_description")
                 sanitized.append(
                     {
                         "hostname": entry.get("hostname"),
-                        "port": entry.get("port"),
+                        "port": port_description or remote_port,
+                        "port_id": remote_port,
+                        "port_description": port_description,
+                        "management_ip": entry.get("management_ip"),
                         "local_interface": entry.get("local_interface") or local_if,
                     }
                 )

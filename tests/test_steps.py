@@ -2,6 +2,7 @@
 
 import json
 import sys
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from typing import Any
 
@@ -1165,6 +1166,30 @@ def test_next_hop_palo_alto_lldp_and_arp(monkeypatch):
                 }
             ]
 
+        def get_mac_table(self, api_key):  # noqa: D401
+            return [
+                {
+                    "mac": "00:11:22:33:44:55",
+                    "interface": "ethernet1/3",
+                }
+            ]
+
+        def config_show(self, api_key, xpath):  # noqa: D401
+            return ET.fromstring(
+                """
+                <response status="success">
+                  <result>
+                    <entry>
+                      <vlan-interface>vlan.200</vlan-interface>
+                      <interface>
+                        <member>ethernet1/3</member>
+                      </interface>
+                    </entry>
+                  </result>
+                </response>
+                """
+            )
+
     monkeypatch.setattr(next_hop_module, "PaloAltoClient", DummyClient)
 
     settings = NetworkPathSettings(
@@ -1204,6 +1229,7 @@ def test_next_hop_palo_alto_lldp_and_arp(monkeypatch):
     assert hop["hop_type"] == "layer2+layer3"
     assert "lldp_neighbor" not in hop
     assert "arp_entry" not in hop
+    assert "layer2_hops" not in hop
 
 
 def test_next_hop_palo_alto_layer3_without_lldp(monkeypatch):
@@ -1229,6 +1255,9 @@ def test_next_hop_palo_alto_layer3_without_lldp(monkeypatch):
             return {}
 
         def get_arp_table(self, *_args, **_kwargs):  # noqa: D401
+            return []
+
+        def get_mac_table(self, *_args, **_kwargs):  # noqa: D401
             return []
 
     monkeypatch.setattr(next_hop_module, "PaloAltoClient", DummyClientNoL2)
@@ -1270,6 +1299,122 @@ def test_next_hop_palo_alto_layer3_without_lldp(monkeypatch):
     assert hop["hop_type"] == "layer3"
     assert "lldp_neighbor" not in hop
     assert "arp_entry" not in hop
+
+
+def test_discover_layer2_path_palo_alto(monkeypatch):
+    class DummyClient:
+        def __init__(self, host, verify_ssl, timeout=10, logger=None):
+            self.host = host
+            self.verify_ssl = verify_ssl
+            self.timeout = timeout
+            self.logger = logger
+
+        def keygen(self, username, password):  # noqa: D401
+            return "token"
+
+        def get_lldp_neighbors(self, api_key, interface=None):  # noqa: D401
+            assert api_key == "token"
+            return {
+                "ethernet1/3": [
+                    {
+                        "hostname": "Agg-2",
+                        "port": "Gig2/0",
+                        "local_interface": "ethernet1/3",
+                    }
+                ]
+            }
+
+        def get_arp_table(self, api_key):  # noqa: D401
+            return [
+                {
+                    "ip": "10.60.60.1",
+                    "interface": "ethernet1/3",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                }
+            ]
+
+        def get_mac_table(self, api_key):  # noqa: D401
+            return [
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "interface": "ethernet1/3",
+                }
+            ]
+
+        def config_show(self, api_key, xpath):  # noqa: D401
+            return ET.fromstring(
+                """
+                <response status="success">
+                  <result>
+                    <entry>
+                      <vlan-interface>vlan.200</vlan-interface>
+                      <interface>
+                        <member>ethernet1/3</member>
+                      </interface>
+                    </entry>
+                  </result>
+                </response>
+                """
+            )
+
+        def vlan_members_for_interface(self, api_key, vlan_if):  # noqa: D401
+            if vlan_if in {"vlan.200", "200"}:
+                return ["ethernet1/3"]
+            return []
+
+    monkeypatch.setattr(next_hop_module, "PaloAltoClient", DummyClient)
+
+    settings = NetworkPathSettings(
+        source_ip="10.10.10.10",
+        destination_ip="10.60.60.60",
+        pa=PaloAltoSettings(username="api", password="secret"),
+    )
+
+    device = DeviceRecord(
+        name="PA-Branch",
+        primary_ip="192.0.2.70",
+        platform_slug="palo_alto",
+        platform_name="Palo Alto",
+        napalm_driver=None,
+    )
+
+    ip_record = IPAddressRecord(
+        address="10.60.60.1",
+        prefix_length=31,
+        device_name="Agg-2",
+        interface_name="Gig2/0",
+    )
+
+    class PaloAltoDataSource:
+        def __init__(self, record, ip_record):
+            self._record = record
+            self._ip_record = ip_record
+
+        def get_device(self, name):  # noqa: D401
+            if name == self._record.name:
+                return self._record
+            return None
+
+        def get_ip_address(self, address):  # noqa: D401
+            if address == self._ip_record.address:
+                return self._ip_record
+            return None
+
+    data_source = PaloAltoDataSource(device, ip_record)
+    step = NextHopDiscoveryStep(data_source, settings)
+
+    hops = step.discover_layer2_path(
+        device_name=device.name,
+        egress_interface="vlan.200",
+        target_ip="10.60.60.1",
+    )
+
+    assert hops
+    hop = hops[0]
+    assert hop["device_name"] == "Agg-2"
+    assert hop["ingress_interface"] == "Gig2/0"
+    assert hop["mac_address"] == "AA:BB:CC:DD:EE:FF"
+    assert hop["egress_interface"] == "ethernet1/3"
 
 
 def test_next_hop_napalm_handles_missing_routes(monkeypatch):
