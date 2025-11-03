@@ -219,7 +219,10 @@ class NetworkPathTracerJob(Job):
                 except ImportError as exc:
                     self.logger.warning(msg=f"Visualization skipped: pyvis or networkx not installed ({exc})")
                 except Exception as exc:
-                    self.logger.warning(msg=f"Visualization generation failed: {exc}")
+                    import traceback
+
+                    tb = traceback.format_exc()
+                    self.logger.warning(msg=f"Visualization generation failed: {exc}\n{tb}")
 
             # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {

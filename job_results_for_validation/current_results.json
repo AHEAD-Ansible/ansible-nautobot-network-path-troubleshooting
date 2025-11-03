@@ -16,6 +16,17 @@
         {
             "hops": [
                 {
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-1' (MAC 50:01:00:05:00:01).",
+                    "device_name": "L2-Switch-1",
+                    "egress_interface": "Po1",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "Gi0/1",
+                    "mac_address": "50:01:00:05:00:01",
+                    "next_hop_ip": null
+                },
+                {
                     "details": "Resolved via NAPALM on 'Catalyst-1'",
                     "device_name": "Catalyst-1",
                     "egress_interface": "GigabitEthernet1/0/4",
@@ -80,6 +91,17 @@
         },
         {
             "hops": [
+                {
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-1' (MAC 50:01:00:05:00:01).",
+                    "device_name": "L2-Switch-1",
+                    "egress_interface": "Po1",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "Gi0/1",
+                    "mac_address": "50:01:00:05:00:01",
+                    "next_hop_ip": null
+                },
                 {
                     "details": "Resolved via NAPALM on 'Catalyst-1'",
                     "device_name": "Catalyst-1",

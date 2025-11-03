@@ -22,6 +22,8 @@ class Layer2Hop:
     ingress_interface: Optional[str]
     egress_interface: Optional[str]
     mac_address: Optional[str]
+    port_description: Optional[str] = None
+    gateway_interface: Optional[str] = None
     details: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Optional[str]]:
@@ -31,6 +33,8 @@ class Layer2Hop:
             "ingress_interface": self.ingress_interface,
             "egress_interface": self.egress_interface,
             "mac_address": self.mac_address,
+            "port_description": self.port_description,
+            "gateway_interface": self.gateway_interface,
             "details": self.details,
         }
 
@@ -108,84 +112,157 @@ class Layer2Discovery:
                     )
                     if not target_mac:
                         break
+                    mac_entry_on_current = self._lookup_mac_entry(current_conn, target_mac)
+                    if mac_entry_on_current:
+                        mac_interface = mac_entry_on_current.get("interface") or mac_entry_on_current.get("port")
+                        if mac_interface:
+                            if self._logger:
+                                self._logger.debug(
+                                    "Layer2Discovery remapped %s ARP interface %s to MAC interface %s",
+                                    current_device.name if current_device else "unknown",
+                                    current_arp_entry.get("interface"),
+                                    mac_interface,
+                                    extra={"grouping": "layer2-discovery"},
+                                )
+                            current_interface = mac_interface
+                        elif self._logger:
+                            self._logger.debug(
+                                "Layer2Discovery found MAC entry without interface on %s: %s",
+                                current_device.name if current_device else "unknown",
+                                mac_entry_on_current,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                    elif self._logger:
+                        self._logger.debug(
+                            "Layer2Discovery could not find MAC %s on %s",
+                            target_mac,
+                            current_device.name if current_device else "unknown",
+                            extra={"grouping": "layer2-discovery"},
+                        )
 
                 neighbors_map = self._normalize_neighbor_map(current_neighbors)
-                neighbor_info = self._select_neighbor_for_interface(neighbors_map, current_interface)
-                if neighbor_info is None:
-                    break
+                candidate_neighbors = self._candidate_neighbors_for_interface(neighbors_map, current_interface)
+                neighbor_found = False
 
-                neighbor_name = neighbor_info.get("hostname")
-                if not neighbor_name:
-                    break
-                normalized_neighbor = self._normalize_hostname(neighbor_name)
-                if not normalized_neighbor:
-                    break
+                for neighbor_info in candidate_neighbors:
+                    neighbor_name = neighbor_info.get("hostname")
+                    if not neighbor_name:
+                        continue
+                    normalized_neighbor = self._normalize_hostname(neighbor_name)
+                    if not normalized_neighbor:
+                        continue
 
-                neighbor_device = self._data_source.get_device(neighbor_name)
-                if not neighbor_device or not neighbor_device.primary_ip:
-                    break
+                    neighbor_device = self._data_source.get_device(neighbor_name)
+                    if not neighbor_device or not neighbor_device.primary_ip:
+                        if self._logger:
+                            self._logger.debug(
+                                "Skipping neighbor %s due to missing device record or primary IP",
+                                neighbor_name,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
 
-                # Stop if this neighbor already owns the next-hop IP (layer-3 device).
-                owner_record = self._data_source.get_ip_address(next_hop_ip)
-                if owner_record and self._normalize_hostname(owner_record.device_name) == normalized_neighbor:
-                    break
+                    owner_record = self._data_source.get_ip_address(next_hop_ip)
+                    if owner_record and self._normalize_hostname(owner_record.device_name) == normalized_neighbor:
+                        if self._logger:
+                            self._logger.debug(
+                                "%s already owns %s; stopping at layer-3 boundary",
+                                neighbor_name,
+                                next_hop_ip,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
 
-                neighbor_driver = self._select_driver(neighbor_device)
-                neighbor_conn = self._open_napalm_connection(
-                    device=neighbor_device,
-                    driver_name=neighbor_driver,
-                    napalm_settings=napalm_settings,
-                )
-                if neighbor_conn is None:
-                    break
-                opened_connections.append(neighbor_conn)
+                    neighbor_driver = self._select_driver(neighbor_device)
+                    neighbor_conn = self._open_napalm_connection(
+                        device=neighbor_device,
+                        driver_name=neighbor_driver,
+                        napalm_settings=napalm_settings,
+                    )
+                    if neighbor_conn is None:
+                        if self._logger:
+                            self._logger.debug(
+                                "Failed to open NAPALM connection to %s; trying next neighbor",
+                                neighbor_name,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
+                    opened_connections.append(neighbor_conn)
 
-                try:
-                    neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac)
-                    neighbor_neighbors_raw = self._collect_lldp_neighbors(neighbor_conn, neighbor_device.name)
-                except Exception as exc:  # pragma: no cover - defensive logging
-                    if self._logger:
-                        self._logger.debug(
+                    try:
+                        neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac)
+                        neighbor_neighbors_raw = self._collect_lldp_neighbors(neighbor_conn, neighbor_device.name)
+                    except Exception as exc:  # pragma: no cover - defensive logging
+                        if self._logger:
+                            self._logger.debug(
                             f"Layer 2 discovery failed on '{neighbor_device.name}': {exc}",
                             extra={"grouping": "layer2-discovery"},
                         )
-                    break
+                        continue
 
-                if not neighbor_mac_entry:
-                    break
+                    if not neighbor_mac_entry:
+                        if self._logger:
+                            self._logger.debug(
+                                "%s does not have MAC %s in its table; skipping",
+                                neighbor_device.name,
+                                target_mac,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
 
-                egress_on_neighbor = neighbor_mac_entry.get("interface") or neighbor_mac_entry.get("port")
-                if not egress_on_neighbor:
-                    break
+                    egress_on_neighbor = neighbor_mac_entry.get("interface") or neighbor_mac_entry.get("port")
+                    if not egress_on_neighbor:
+                        if self._logger:
+                            self._logger.debug(
+                                "MAC entry on %s lacks interface/port info; skipping",
+                                neighbor_device.name,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
 
-                normalized_egress = self._normalize_interface(egress_on_neighbor) or (egress_on_neighbor or "")
-                visit_key = (normalized_neighbor, normalized_egress)
-                if visit_key in visited_targets:
-                    break
+                    normalized_egress = self._normalize_interface(egress_on_neighbor) or (egress_on_neighbor or "")
+                    visit_key = (normalized_neighbor, normalized_egress)
+                    if visit_key in visited_targets:
+                        if self._logger:
+                            self._logger.debug(
+                                "Already visited neighbor %s via %s; skipping",
+                                neighbor_device.name,
+                                egress_on_neighbor,
+                                extra={"grouping": "layer2-discovery"},
+                            )
+                        continue
 
-                mac_text = target_mac or "unknown"
-                details = f"Layer 2 hop resolved via LLDP/MAC on '{neighbor_device.name}' (MAC {mac_text})."
-                layer2_hops.append(
-                    Layer2Hop(
-                        device_name=neighbor_device.name,
-                        ingress_interface=neighbor_info.get("port"),
-                        egress_interface=egress_on_neighbor,
-                        mac_address=target_mac,
-                        details=details,
+                    mac_text = target_mac or "unknown"
+                    details = f"Layer 2 hop resolved via LLDP/MAC on '{neighbor_device.name}' (MAC {mac_text})."
+                    ingress_on_neighbor = neighbor_info.get("port") or neighbor_info.get("port_description")
+                    layer2_hops.append(
+                        Layer2Hop(
+                            device_name=neighbor_device.name,
+                            ingress_interface=ingress_on_neighbor,
+                            egress_interface=egress_on_neighbor,
+                            mac_address=target_mac,
+                            port_description=neighbor_info.get("port_description"),
+                            gateway_interface=current_interface,
+                            details=details,
+                        )
                     )
-                )
 
-                # Re-check ownership after adding the hop (neighbour might still not be L3 owner).
-                owner_record = self._data_source.get_ip_address(next_hop_ip)
-                if owner_record and self._normalize_hostname(owner_record.device_name) == normalized_neighbor:
+                    owner_record = self._data_source.get_ip_address(next_hop_ip)
+                    if owner_record and self._normalize_hostname(owner_record.device_name) == normalized_neighbor:
+                        neighbor_found = True
+                        break
+
+                    visited_targets.add(visit_key)
+                    current_device = neighbor_device
+                    current_conn = neighbor_conn
+                    current_driver_name = neighbor_driver
+                    current_neighbors = neighbor_neighbors_raw
+                    current_interface = egress_on_neighbor
+                    neighbor_found = True
                     break
 
-                visited_targets.add(visit_key)
-                current_device = neighbor_device
-                current_conn = neighbor_conn
-                current_driver_name = neighbor_driver
-                current_neighbors = neighbor_neighbors_raw
-                current_interface = egress_on_neighbor
+                if not neighbor_found:
+                    break
         finally:
             for conn in opened_connections:
                 try:
@@ -225,6 +302,42 @@ class Layer2Discovery:
             return None
         candidates = neighbors.get(normalized, [])
         return candidates[0] if candidates else None
+
+    def _candidate_neighbors_for_interface(
+        self,
+        neighbors: Dict[str, List[Dict[str, Optional[str]]]],
+        interface: Optional[str],
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return prioritized LLDP neighbor entries for ``interface``."""
+
+        ordered: List[Dict[str, Optional[str]]] = []
+        seen: set[int] = set()
+        normalized_target = self._normalize_interface(interface)
+
+        def _push(entry: Dict[str, Optional[str]], priority: int) -> None:
+            key = id(entry)
+            if key in seen:
+                return
+            seen.add(key)
+            entry.setdefault("_priority", priority)
+            ordered.append(entry)
+
+        if normalized_target and normalized_target in neighbors:
+            for entry in neighbors.get(normalized_target, []):
+                _push(entry, 0)
+
+        for local_if, entries in neighbors.items():
+            normalized_local = self._normalize_interface(local_if)
+            for entry in entries:
+                if normalized_target and normalized_target.startswith("po") and normalized_local and normalized_local.startswith(("gi", "eth", "et", "te", "fa")):
+                    _push(entry, 1)
+                else:
+                    _push(entry, 2)
+
+        ordered.sort(key=lambda e: (e.get("_priority", 99), str(e.get("local_interface") or "")))
+        for entry in ordered:
+            entry.pop("_priority", None)
+        return ordered
 
     def _lookup_arp_entry(self, device_conn, ip_address: str) -> Optional[Dict[str, str]]:
         """Return ARP entry for ``ip_address`` if present."""

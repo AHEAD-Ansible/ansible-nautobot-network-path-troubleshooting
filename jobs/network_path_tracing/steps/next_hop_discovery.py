@@ -881,6 +881,15 @@ class NextHopDiscoveryStep:
         if not device_name or not egress_interface or not target_ip:
             return []
 
+        if self._logger:
+            self._logger.debug(
+                "Discovering layer2 path from %s via %s toward %s",
+                device_name,
+                egress_interface,
+                target_ip,
+                extra={"grouping": "layer2-discovery"},
+            )
+
         device = self._data_source.get_device(device_name)
         if not device or not device.primary_ip:
             return []
@@ -914,6 +923,10 @@ class NextHopDiscoveryStep:
 
         helper = self._build_layer2_helper()
         if helper is None:
+            if self._logger:
+                self._logger.debug(
+                    "Layer2 helper unavailable for %s", device_name, extra={"grouping": "layer2-discovery"}
+                )
             return []
 
         napalm_settings = self._settings.napalm_settings()
@@ -1067,12 +1080,14 @@ class NextHopDiscoveryStep:
                 )
 
         chosen_neighbors: Optional[List[Dict[str, Optional[str]]]] = None
+        resolved_gateway_interface: Optional[str] = None
         for iface in interfaces_to_query:
             if not iface:
                 continue
             candidate_list = neighbors.get(iface)
             if candidate_list:
                 chosen_neighbors = candidate_list
+                resolved_gateway_interface = interface_aliases.get(iface, iface)
                 break
         if chosen_neighbors is None:
             if self._logger:
@@ -1083,6 +1098,8 @@ class NextHopDiscoveryStep:
                     extra={"grouping": "layer2-discovery"},
                 )
             return []
+        if resolved_gateway_interface is None:
+            resolved_gateway_interface = interface_aliases.get(egress_norm, egress_interface) or egress_interface
 
         neighbors_for_helper: Dict[str, List[Dict[str, Optional[str]]]] = {
             key: list(entries or []) for key, entries in neighbors.items()
@@ -1135,7 +1152,13 @@ class NextHopDiscoveryStep:
                     )
             else:
                 if hops:
-                    return [hop.as_dict() for hop in hops]
+                    serialized: List[Dict[str, Optional[str]]] = []
+                    for index, hop in enumerate(hops):
+                        payload = hop.as_dict()
+                        if index == 0 and resolved_gateway_interface:
+                            payload["gateway_interface"] = resolved_gateway_interface
+                        serialized.append(payload)
+                    return serialized
 
         neighbor = self._match_lldp_neighbor(chosen_neighbors, target_ip)
         if not neighbor:
@@ -1190,6 +1213,7 @@ class NextHopDiscoveryStep:
                 "ingress_interface": ingress_on_neighbor,
                 "egress_interface": egress_on_neighbor,
                 "mac_address": mac_addr_norm,
+                "gateway_interface": resolved_gateway_interface or egress_interface,
                 "details": details,
             }
         ]

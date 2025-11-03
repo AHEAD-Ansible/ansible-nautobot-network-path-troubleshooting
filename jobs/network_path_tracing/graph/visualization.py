@@ -33,8 +33,14 @@ def build_pyvis_network(
 
     highlight = set(highlight_path or [])
 
+    id_map: dict[object, str] = {}
+
     for node_id, data in graph.graph.nodes(data=True):
+        node_key = str(node_id)
+        id_map[node_id] = node_key
         label = data.get("label") or node_id
+        if not isinstance(label, str):
+            label = str(label)
         title_lines = [f"{key}: {value}" for key, value in sorted(data.items()) if key != "label"]
         title = "<br/>".join(title_lines) if title_lines else label
         color = None
@@ -50,7 +56,7 @@ def build_pyvis_network(
             color = "#06d6a0"
         elif role == "destination":
             color = "#ef476f"
-        net.add_node(node_id, label=label, title=title, color=color, shape=shape)
+        net.add_node(node_key, label=label, title=title, color=color, shape=shape)
 
     edge_occurrences: dict[tuple[str, str], int] = {}
 
@@ -72,12 +78,14 @@ def build_pyvis_network(
             direction = "curvedCW" if idx % 2 == 1 else "curvedCCW"
             roundness = min(0.8, 0.25 + 0.15 * (idx // 2))
             smooth = {"enabled": True, "type": direction, "roundness": roundness}
-        edge_id = f"{source}->{target}::{key}_{idx}"
+        source_key = id_map.get(source, str(source))
+        target_key = id_map.get(target, str(target))
+        edge_id = f"{source_key}->{target_key}::{key}_{idx}"
         label = data.get("egress_interface") or data.get("next_hop_ip")
         dashes = bool(data.get("dashed"))
         net.add_edge(
-            source,
-            target,
+            source_key,
+            target_key,
             id=edge_id,
             title=title,
             label=label,
