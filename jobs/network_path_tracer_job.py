@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ipaddress
+import subprocess
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from django.core.exceptions import ObjectDoesNotExist, FieldError
-from nautobot.apps.jobs import Job, ObjectVar, StringVar, register_jobs
+from nautobot.apps.jobs import BooleanVar, Job, ObjectVar, StringVar, register_jobs
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import CustomField, SecretsGroup
 from nautobot.extras.secrets.exceptions import SecretError
@@ -48,7 +49,7 @@ class NetworkPathTracerJob(Job):
         has_sensitive_variables = False
         read_only = True
         dryrun_default = False  # Explicit for clarity, though read_only
-        field_order = ["source_ip", "destination_ip", "secrets_group"]  # UI form order
+        field_order = ["source_ip", "destination_ip", "secrets_group", "enable_layer2_discovery", "ping_endpoints"]
         # soft_time_limit / time_limit could be added if long-running
 
     source_ip = StringVar(
@@ -67,8 +68,25 @@ class NetworkPathTracerJob(Job):
         description="Secrets Group providing Generic username/password credentials for device lookups.",
         required=True,
     )
+    enable_layer2_discovery = BooleanVar(
+        description="Enable layer 2 neighbor discovery between layer 3 hops.",
+        default=True,
+    )
+    ping_endpoints = BooleanVar(
+        description="Ping the source and destination before tracing to refresh ARP/ND tables.",
+        default=False,
+    )
 
-    def run(self, *, source_ip: str, destination_ip: str, secrets_group: SecretsGroup, **kwargs) -> dict:
+    def run(
+        self,
+        *,
+        source_ip: str,
+        destination_ip: str,
+        secrets_group: SecretsGroup,
+        enable_layer2_discovery: bool = True,
+        ping_endpoints: bool = False,
+        **kwargs,
+    ) -> dict:
         """Execute the full network path tracing workflow.
 
         Args:
@@ -144,53 +162,70 @@ class NetworkPathTracerJob(Job):
         try:
             resolved_source_ip = resolve_target_to_ipv4(source_input, "source")
             resolved_destination_ip = resolve_target_to_ipv4(destination_input, "destination")
+        except InputValidationError as exc:
+            self._fail_job(str(exc))
+            return {}
 
-            self._log_hostname_resolution("source", source_candidate, resolved_source_ip)
-            self._log_hostname_resolution("destination", destination_candidate, resolved_destination_ip)
+        self._log_hostname_resolution("source", source_candidate, resolved_source_ip)
+        self._log_hostname_resolution("destination", destination_candidate, resolved_destination_ip)
 
-            # Initialize settings and override credentials with secrets group values
-            base_settings = NetworkPathSettings(
-                source_ip=resolved_source_ip,
-                destination_ip=resolved_destination_ip,
-            )
-            settings = replace(
-                base_settings,
-                pa=replace(base_settings.pa, username=username, password=password),
-                napalm=replace(base_settings.napalm, username=username, password=password),
-                f5=replace(base_settings.f5, username=username, password=password),
-            )
-            self.logger.debug(
-                msg=(
-                    f"Normalized settings: source_ip={settings.source_ip}, "
-                    f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
-                )
+        # Validate the resolved addresses
+        normalized_source = self._to_address_string(resolved_source_ip)
+        normalized_destination = self._to_address_string(resolved_destination_ip)
+        try:
+            ipaddress.ip_address(normalized_source)
+            ipaddress.ip_address(normalized_destination)
+        except ValueError as exc:  # pragma: no cover - defensive guardrail
+            self._fail_job(f"Invalid IP address after resolution: {exc}")
+            return {}
+
+        # Initialize settings and override credentials with secrets group values
+        base_settings = NetworkPathSettings(
+            source_ip=normalized_source,
+            destination_ip=normalized_destination,
+        )
+        settings = replace(
+            base_settings,
+            pa=replace(base_settings.pa, username=username, password=password),
+            napalm=replace(base_settings.napalm, username=username, password=password),
+            f5=replace(base_settings.f5, username=username, password=password),
+            enable_layer2_discovery=enable_layer2_discovery,
+        )
+        self.logger.debug(
+            msg=(
+                f"Normalized settings: source_ip={settings.source_ip}, "
+                f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
             )
 
-            # Initialize workflow steps (modular for testability)
-            data_source = NautobotORMDataSource()
-            validation_step = InputValidationStep(data_source)
-            gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
-            next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
-            path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
+        if ping_endpoints:
+            self.logger.info("Pinging source and destination endpoints before tracing.")
+            self._ping_endpoint("source", normalized_source)
+            self._ping_endpoint("destination", normalized_destination)
+
+        # Initialize workflow steps (modular for testability)
+        data_source = NautobotORMDataSource()
+        validation_step = InputValidationStep(data_source)
+        gateway_step = GatewayDiscoveryStep(data_source, settings.gateway_custom_field)
+        next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
+        path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
 
             # Step 1: Validate inputs
             self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
-            if not validation.source_found:
+            if not getattr(validation, "source_found", True):
                 self.logger.warning(
                     msg=(
-                        f"Source IP {resolved_source_ip} not found in Nautobot; "
+                        f"Source IP {normalized_source} not found in Nautobot; "
                         "continuing with prefix-based gateway discovery."
                     )
                 )
             self.logger.success("Input validation completed successfully")
 
-            destination_record = data_source.get_ip_address(resolved_destination_ip)
-            destination_found = destination_record is not None
-            if not destination_found:
+            destination_record = data_source.get_ip_address(normalized_destination)
+            if destination_record is None:
                 self.logger.warning(
                     msg=(
-                        f"Destination IP {resolved_destination_ip} not found in Nautobot; "
+                        f"Destination IP {normalized_destination} not found in Nautobot; "
                         "path tracing will continue without destination metadata."
                     )
                 )
@@ -217,7 +252,10 @@ class NetworkPathTracerJob(Job):
                 except ImportError as exc:
                     self.logger.warning(msg=f"Visualization skipped: pyvis or networkx not installed ({exc})")
                 except Exception as exc:
-                    self.logger.warning(msg=f"Visualization generation failed: {exc}")
+                    import traceback
+
+                    tb = traceback.format_exc()
+                    self.logger.warning(msg=f"Visualization generation failed: {exc}\n{tb}")
 
             # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {
@@ -307,6 +345,45 @@ class NetworkPathTracerJob(Job):
             return value.split("/")[0]
         return str(value).split("/")[0]
 
+    def _ping_endpoint(self, label: str, ip_address: str) -> None:
+        """Best-effort ICMP reachability check with logging."""
+
+        command = ["ping", "-c", "3", "-W", "1", ip_address]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            self.logger.warning(
+                "Ping utility not available; skipping reachability check for %s (%s).",
+                label,
+                ip_address,
+            )
+            return
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.warning(
+                "Ping attempt for %s (%s) failed to start: %s",
+                label,
+                ip_address,
+                exc,
+            )
+            return
+
+        if result.returncode == 0:
+            self.logger.info("Ping %s (%s) succeeded.", label, ip_address)
+        else:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            self.logger.warning(
+                "Ping %s (%s) failed (rc=%s): %s",
+                label,
+                ip_address,
+                result.returncode,
+                detail,
+            )
+
     @staticmethod
     def _hop_to_payload(hop: PathHop) -> Dict[str, Any]:
         """Serialize a PathHop, merging any extra metadata."""
@@ -318,6 +395,8 @@ class NetworkPathTracerJob(Job):
             "next_hop_ip": hop.next_hop_ip,
             "details": hop.details,
         }
+        if hop.hop_type:
+            payload["hop type"] = {"classification": hop.hop_type}
         for key, value in (hop.extras or {}).items():
             if value is None:
                 continue

@@ -9,18 +9,8 @@ from .exceptions import InputValidationError
 
 
 def resolve_target_to_ipv4(value: str, field_label: str) -> str:
-    """Resolve a user-supplied IP address or hostname to an IPv4 string.
+    """Resolve a user-supplied IP address or hostname to an IPv4 string."""
 
-    Args:
-        value: Raw user input, potentially including a prefix length or hostname.
-        field_label: Human-readable label for error messages (e.g., "source").
-
-    Returns:
-        str: The resolved IPv4 address.
-
-    Raises:
-        InputValidationError: If the input is empty, resolves to IPv6, or cannot be resolved.
-    """
     raw_input = (value or "").strip()
     if not raw_input:
         raise InputValidationError(f"Missing {field_label} IP address or hostname.")

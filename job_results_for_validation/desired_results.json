@@ -1,4 +1,8 @@
 {
+    "destination": {
+        "address": "10.200.200.200",
+        "device_name": "Server-2"
+    },
     "gateway": {
         "address": "10.100.100.1",
         "details": "Gateway tagged via custom field and resolved to interface redundancy member with the highest configured priority for IP 10.100.100.1.",
@@ -12,9 +16,23 @@
         {
             "hops": [
                 {
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-1' (MAC 50:01:00:05:00:01).",
+                    "device_name": "L2-Switch-1",
+                    "egress_interface": "Po1",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "Gi0/1",
+                    "mac_address": "50:01:00:05:00:01",
+                    "next_hop_ip": null
+                },
+                {
                     "details": "Resolved via NAPALM on 'Catalyst-1'",
                     "device_name": "Catalyst-1",
                     "egress_interface": "GigabitEthernet1/0/4",
+                    "hop type": {
+                        "classification": "layer2+layer3"
+                    },
                     "ingress_interface": "Vlan100",
                     "next_hop_ip": "172.4.4.2"
                 },
@@ -22,6 +40,9 @@
                     "details": "Resolved via NX-OS CLI on 'NXOS-2'",
                     "device_name": "NXOS-2",
                     "egress_interface": "Eth1/1",
+                    "hop type": {
+                        "classification": "layer3"
+                    },
                     "ingress_interface": "Ethernet1/4",
                     "next_hop_ip": "172.12.12.1"
                 },
@@ -29,46 +50,39 @@
                     "details": "Resolved using virtual-router 'Internal' on 'PA-Outside'",
                     "device_name": "PA-Outside",
                     "egress_interface": "ethernet1/3",
+                    "hop type": {
+                        "classification": "layer2+layer3"
+                    },
                     "ingress_interface": "ethernet1/2",
                     "next_hop_ip": "172.13.13.2"
                 },
                 {
-                    "details": "Resolved using virtual-router 'Internal' on 'PA-Inside'",
+                    "details": "Destination within subnet of interface 'vlan.200'.",
                     "device_name": "PA-Inside",
-                    "egress_interface": "ethernet1/3",
+                    "egress_interface": "vlan.200",
+                    "hop type": {
+                        "classification": "layer3"
+                    },
                     "ingress_interface": "ethernet1/1",
-                    "next_hop_ip": "172.20.20.2"
+                    "next_hop_ip": "10.200.200.200"
                 },
                 {
-                    "details": "Resolved via F5 API on 'BIGIP-1'",
-                    "device_name": "BIGIP-1",
-                    "egress_interface": "1.2",
-                    "egress_self_ip": "/Common/self_internal",
-                    "egress_self_ip_address": "10.251.0.1/24",
-                    "egress_vlan": "/Common/vlan_internal",
-                    "ingress_vlan": "/Common/vlan_external",
-                    "ingress_interface": "1.1",
-                    "next_hop_ip": "10.251.0.205",
-                    "pools_containing_member": [
-                        "/Common/pool_web_http"
-                    ],
-                    "virtual_servers": [
-                        {
-                            "name": "/Common/vs_web_http_10.249.0.100_80",
-                            "virtual_address": "10.249.0.100"
-                        },
-                        {
-                            "name": "/Common/vs_web_https_10.249.0.100_443",
-                            "virtual_address": "10.249.0.100"
-                        }
-                    ]
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-2' (MAC 50:01:00:06:00:01).",
+                    "device_name": "L2-Switch-2",
+                    "egress_interface": "Gi0/1",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "GigabitEthernet0/3",
+                    "mac_address": "50:01:00:06:00:01",
+                    "next_hop_ip": null
                 },
                 {
                     "details": "Destination device resolved via Nautobot",
-                    "device_name": "Server-SNAT",
+                    "device_name": "Server-2",
                     "egress_interface": null,
                     "ingress_interface": "eth1",
-                    "next_hop_ip": "10.251.0.205"
+                    "next_hop_ip": "10.200.200.200"
                 }
             ],
             "issues": [],
@@ -78,9 +92,30 @@
         {
             "hops": [
                 {
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-1' (MAC 50:01:00:05:00:01).",
+                    "device_name": "L2-Switch-1",
+                    "egress_interface": "Gi0/2",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "Gi0/1",
+                    "mac_address": "50:01:00:05:00:01",
+                    "next_hop_ip": null
+                },
+                {
+                    "details": "Resolved via NAPALM on 'Catalyst-2'",
+                    "device_name": "Catalyst-2",
+                    "hop type": {
+                        "classification": "hsrp secondary"
+                    }
+                },
+                {
                     "details": "Resolved via NAPALM on 'Catalyst-1'",
                     "device_name": "Catalyst-1",
                     "egress_interface": "GigabitEthernet1/0/3",
+                    "hop type": {
+                        "classification": "layer3"
+                    },
                     "ingress_interface": "Vlan100",
                     "next_hop_ip": "172.3.3.2"
                 },
@@ -88,6 +123,9 @@
                     "details": "Resolved via NX-OS CLI on 'NXOS-1'",
                     "device_name": "NXOS-1",
                     "egress_interface": "Eth1/1",
+                    "hop type": {
+                        "classification": "layer3"
+                    },
                     "ingress_interface": "Ethernet1/3",
                     "next_hop_ip": "172.11.11.1"
                 },
@@ -95,46 +133,39 @@
                     "details": "Resolved using virtual-router 'Internal' on 'PA-Outside'",
                     "device_name": "PA-Outside",
                     "egress_interface": "ethernet1/3",
+                    "hop type": {
+                        "classification": "layer2+layer3"
+                    },
                     "ingress_interface": "ethernet1/1",
                     "next_hop_ip": "172.13.13.2"
                 },
                 {
-                    "details": "Resolved using virtual-router 'Internal' on 'PA-Inside'",
+                    "details": "Destination within subnet of interface 'vlan.200'.",
                     "device_name": "PA-Inside",
-                    "egress_interface": "ethernet1/3",
+                    "egress_interface": "vlan.200",
+                    "hop type": {
+                        "classification": "layer3"
+                    },
                     "ingress_interface": "ethernet1/1",
-                    "next_hop_ip": "172.20.20.2"
+                    "next_hop_ip": "10.200.200.200"
                 },
                 {
-                    "details": "Resolved via F5 API on 'BIGIP-1'",
-                    "device_name": "BIGIP-1",
-                    "egress_interface": "1.2",
-                    "egress_self_ip": "/Common/self_internal",
-                    "egress_self_ip_address": "10.251.0.1/24",
-                    "egress_vlan": "/Common/vlan_internal",
-                    "ingress_vlan": "/Common/vlan_external",
-                    "ingress_interface": "1.1",
-                    "next_hop_ip": "10.251.0.205",
-                    "pools_containing_member": [
-                        "/Common/pool_web_http"
-                    ],
-                    "virtual_servers": [
-                        {
-                            "name": "/Common/vs_web_http_10.249.0.100_80",
-                            "virtual_address": "10.249.0.100"
-                        },
-                        {
-                            "name": "/Common/vs_web_https_10.249.0.100_443",
-                            "virtual_address": "10.249.0.100"
-                        }
-                    ]
+                    "details": "Layer 2 hop resolved via LLDP/MAC on 'L2-Switch-2' (MAC 50:01:00:06:00:01).",
+                    "device_name": "L2-Switch-2",
+                    "egress_interface": "Gi0/1",
+                    "hop type": {
+                        "classification": "layer2"
+                    },
+                    "ingress_interface": "GigabitEthernet0/3",
+                    "mac_address": "50:01:00:06:00:01",
+                    "next_hop_ip": null
                 },
                 {
                     "details": "Destination device resolved via Nautobot",
-                    "device_name": "Server-SNAT",
+                    "device_name": "Server-2",
                     "egress_interface": null,
                     "ingress_interface": "eth1",
-                    "next_hop_ip": "10.251.0.205"
+                    "next_hop_ip": "10.200.200.200"
                 }
             ],
             "issues": [],
@@ -151,12 +182,6 @@
         "is_host_ip": false,
         "prefix": "10.100.100.0/24",
         "prefix_length": 24
-    },
-    "destination": {
-        "input": "10.251.0.205",
-        "found_in_nautobot": true,
-        "address": "10.251.0.205",
-        "device_name": "Server-SNAT"
     },
     "status": "success",
     "visualization": "See attached 'network_path_trace.html' for interactive graph."

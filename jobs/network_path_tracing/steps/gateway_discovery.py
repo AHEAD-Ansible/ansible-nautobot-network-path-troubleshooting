@@ -57,22 +57,23 @@ class GatewayDiscoveryStep:
 
         fallback_record, from_nautobot = self._fallback_to_lowest_host(validation)
         if fallback_record:
+            original_device = fallback_record.device_name
             adjusted_record, _, _, members = self._resolve_gateway_via_redundancy(fallback_record)
             detail_parts = ["Used lowest usable IP address as the gateway fallback."]
             if not from_nautobot:
                 detail_parts.append("Address not present in Nautobot.")
-            if members:
-                detail_parts.append("Interface redundancy resolved the preferred member.")
+            if members or (not original_device and adjusted_record.device_name):
+                detail_parts.append("Resolved gateway interface via interface redundancy groups.")
             elif adjusted_record.device_name and adjusted_record.interface_name:
                 detail_parts.append(
                     f"Resolved to device '{adjusted_record.device_name}' interface '{adjusted_record.interface_name}'."
                 )
-            detail = " ".join(detail_parts)
+            details = " ".join(detail_parts)
             return GatewayDiscoveryResult(
                 found=True,
                 method="lowest_host",
                 gateway=adjusted_record,
-                details=detail,
+                details=details,
                 redundant_members=members,
             )
 
@@ -82,7 +83,7 @@ class GatewayDiscoveryStep:
 
     def _fallback_to_lowest_host(
         self, validation: InputValidationResult
-    ) -> Tuple[Optional[IPAddressRecord], bool]:
+    ) -> tuple[Optional[IPAddressRecord], bool]:
         """Fall back to the lowest usable host IP in the prefix."""
         network = ipaddress.ip_network(validation.source_prefix.prefix)
         if network.version == 4 and network.prefixlen >= 30:
