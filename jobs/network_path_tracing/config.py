@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 _DEFAULT_SOURCE_IP = "10.100.100.100"
 _DEFAULT_DESTINATION_IP = "10.200.200.200"
 _DEFAULT_GATEWAY_CUSTOM_FIELD = "network_gateway"
+_DEFAULT_LAYER2_MAX_DEPTH = 3
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -27,6 +28,17 @@ def _env_csv(name: str) -> tuple[str, ...]:
         return ()
     parts = [item.strip() for item in value.split(",")]
     return tuple(part for part in parts if part)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Return integer value from environment or default."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,8 @@ class NetworkPathSettings:
     pa: PaloAltoSettings = PaloAltoSettings()
     napalm: NapalmSettings = NapalmSettings()
     f5: F5Settings = F5Settings()
+    enable_layer2_discovery: bool = _env_flag("NETWORK_PATH_ENABLE_LAYER2", True)
+    layer2_max_depth: int = _env_int("NETWORK_PATH_LAYER2_MAX_DEPTH", _DEFAULT_LAYER2_MAX_DEPTH)
 
     def as_tuple(self) -> tuple[str, str]:
         """Return source and destination IPs as a tuple."""

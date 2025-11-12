@@ -71,6 +71,13 @@ class NetworkPathGraph:
         self.ensure_node(target)
         if hop is not None:
             attrs.setdefault("hop", hop)
+        source_role = self._graph.nodes[source].get("role")
+        target_role = self._graph.nodes[target].get("role")
+        if (
+            (source_role == "layer2" or target_role == "layer2")
+            and "dashed" not in attrs
+        ):
+            attrs["dashed"] = True
         edge_key = key or attrs.get("next_hop_ip") or attrs.get("egress_interface")
         self._graph.add_edge(source, target, key=edge_key, **attrs)
 

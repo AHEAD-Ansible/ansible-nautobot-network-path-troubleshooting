@@ -5,17 +5,18 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
-from ..interfaces.palo_alto import PaloAltoClient
+from ..interfaces.palo_alto import PaloAltoClient, _parse_vlan_members
 from ..interfaces.f5_bigip import F5Client, F5APIError
 from .gateway_discovery import GatewayDiscoveryResult
 from .input_validation import InputValidationResult
+from .layer2_discovery import Layer2Discovery
 
 try:
     import napalm
@@ -52,6 +53,13 @@ class NextHopDiscoveryStep:
         self._settings = settings
         self._logger = logger
         self._cache: Dict[Tuple[str, str], NextHopDiscoveryResult | str] = {}
+        self._lldp_cache: Dict[str, Dict[str, List[Dict[str, Optional[str]]]]] = {}
+        self._ip_device_cache: Dict[str, Optional[str]] = {}
+        self._palo_lldp_cache: Dict[str, Dict[str, List[Dict[str, Optional[str]]]]] = {}
+        self._palo_arp_cache: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+        self._palo_mac_cache: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+        self._palo_vlan_member_cache: Dict[str, List[str]] = {}
+        self._layer2_helper: Optional[Layer2Discovery] = None
 
     def run(self, validation: InputValidationResult, gateway: GatewayDiscoveryResult) -> NextHopDiscoveryResult:
         """Execute next-hop discovery for the destination IP.
@@ -88,10 +96,7 @@ class NextHopDiscoveryStep:
         # Check if device is Palo Alto based on platform_slug or platform_name
         platform_slug_lower = (device.platform_slug or "").lower()
         platform_name_lower = (device.platform_name or "").lower()
-        is_palo_alto = any(
-            indicator in platform_slug_lower or indicator in platform_name_lower
-            for indicator in self._PALO_ALTO_INDICATORS
-        )
+        is_palo_alto = self._is_palo_alto_device(device)
         is_f5 = any(
             indicator in platform_slug_lower or indicator in platform_name_lower
             for indicator in self._F5_INDICATORS
@@ -200,9 +205,34 @@ class NextHopDiscoveryStep:
             if fallback_used:
                 detail += " (route-lookup fallback)"
 
+            hop_payload: Dict[str, object] = {
+                "next_hop_ip": merged.get("next_hop"),
+                "egress_interface": merged.get("egress_interface"),
+            }
+
+            hop_type = self._classify_palo_alto_hop(
+                client=client,
+                api_key=api_key,
+                device=device,
+                egress_interface=merged.get("egress_interface"),
+                next_hop_ip=merged.get("next_hop"),
+            )
+            if hop_type:
+                hop_payload["hop_type"] = hop_type
+            if self._settings.enable_layer2_discovery:
+                layer2_path = self._discover_palo_layer2_path(
+                    client=client,
+                    api_key=api_key,
+                    device=device,
+                    egress_interface=merged.get("egress_interface"),
+                    target_ip=merged.get("next_hop") or destination_ip,
+                )
+                if layer2_path:
+                    hop_payload["layer2_hops"] = layer2_path
+
             return NextHopDiscoveryResult(
                 found=found,
-                next_hops=[{"next_hop_ip": merged.get("next_hop"), "egress_interface": merged.get("egress_interface")}],
+                next_hops=[hop_payload],
                 details=detail,
             )
         except RuntimeError as exc:
@@ -289,6 +319,8 @@ class NextHopDiscoveryStep:
                     password=napalm_settings.password,
                     optional_args=optional_args,
                 ) as device_conn:
+                    lldp_neighbors = self._collect_lldp_neighbors(device_conn, device.name)
+                    layer2_helper = self._build_layer2_helper()
                     if candidate in self._NXOS_DRIVERS:
                         next_hops = self._collect_nxos_routes(device_conn, destination_ip, ingress_if)
                         details = f"Resolved via NX-OS CLI on '{device.name}'"
@@ -296,12 +328,33 @@ class NextHopDiscoveryStep:
                         next_hops = self._collect_generic_routes(device_conn, destination_ip)
                         details = f"Resolved via NAPALM on '{device.name}'"
 
+                    self._annotate_hops_with_lldp(
+                        next_hops=next_hops,
+                        lldp_neighbors=lldp_neighbors,
+                    )
+
                     if not next_hops:
                         return NextHopDiscoveryResult(
                             found=False,
                             next_hops=[],
                             details=f"No route found for '{destination_ip}' on '{device.name}'",
                         )
+
+                    if layer2_helper and lldp_neighbors:
+                        for hop_payload in next_hops:
+                            hop_next_ip = hop_payload.get("next_hop_ip")
+                            hop_egress = hop_payload.get("egress_interface")
+                            target_ip = hop_next_ip or destination_ip
+                            layer2_path = layer2_helper.discover(
+                                initial_device=device,
+                                initial_conn=device_conn,
+                                initial_driver_name=candidate,
+                                initial_lldp_neighbors=lldp_neighbors,
+                                egress_interface=hop_egress,
+                                next_hop_ip=target_ip,
+                            )
+                            if layer2_path:
+                                hop_payload["layer2_hops"] = [hop.as_dict() for hop in layer2_path]
 
                     return NextHopDiscoveryResult(
                         found=True,
@@ -652,3 +705,780 @@ class NextHopDiscoveryStep:
             if isinstance(vrf, str) and vrf.lower() != "default":
                 return vrf
         return None
+
+    def _collect_lldp_neighbors(
+        self,
+        device_conn,
+        device_name: Optional[str],
+    ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        """Return LLDP neighbors keyed by local interface."""
+
+        cache_key = device_name or getattr(device_conn, "hostname", None)
+        if cache_key and cache_key in self._lldp_cache:
+            return self._lldp_cache[cache_key]
+
+        neighbors: Dict[str, List[Dict[str, Optional[str]]]] = {}
+
+        detail = self._safe_get_lldp_neighbors_detail(device_conn)
+        if detail:
+            neighbors = self._normalize_lldp_detail(detail)
+        else:
+            basic = self._safe_get_lldp_neighbors(device_conn)
+            if basic:
+                neighbors = self._normalize_lldp_basic(basic)
+
+        if cache_key:
+            self._lldp_cache[cache_key] = neighbors
+        return neighbors
+
+    def _safe_get_lldp_neighbors_detail(
+        self, device_conn
+    ) -> Optional[Dict[str, Iterable[Dict[str, object]]]]:
+        """Best-effort retrieval of detailed LLDP data."""
+
+        getter = getattr(device_conn, "get_lldp_neighbors_detail", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except NotImplementedError:
+            return None
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if self._logger:
+                self._logger.debug(
+                    f"LLDP detail lookup failed: {exc}",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+            return None
+
+    def _safe_get_lldp_neighbors(
+        self, device_conn
+    ) -> Optional[Dict[str, Iterable[Dict[str, object]]]]:
+        """Best-effort retrieval of basic LLDP data."""
+
+        getter = getattr(device_conn, "get_lldp_neighbors", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except NotImplementedError:
+            return None
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if self._logger:
+                self._logger.debug(
+                    f"LLDP lookup failed: {exc}",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+            return None
+
+    @staticmethod
+    def _normalize_lldp_detail(
+        detail: Dict[str, Iterable[Dict[str, object]]]
+    ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        normalized: Dict[str, List[Dict[str, Optional[str]]]] = {}
+        for local_if, entries in detail.items():
+            if not isinstance(entries, Iterable):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                hostname = (
+                    entry.get("remote_system_name")
+                    or entry.get("remote_chassis_id")
+                    or entry.get("remote_system_description")
+                )
+                port = (
+                    entry.get("remote_port")
+                    or entry.get("remote_port_id")
+                    or entry.get("remote_port_desc")
+                )
+                if not hostname and not port:
+                    continue
+                normalized.setdefault(local_if, []).append(
+                    {
+                        "hostname": str(hostname) if hostname else None,
+                        "port": str(port) if port else None,
+                        "local_interface": local_if,
+                    }
+                )
+        return normalized
+
+    @staticmethod
+    def _normalize_lldp_basic(
+        basic: Dict[str, Iterable[Dict[str, object]]]
+    ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        normalized: Dict[str, List[Dict[str, Optional[str]]]] = {}
+        for local_if, entries in basic.items():
+            if not isinstance(entries, Iterable):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                hostname = entry.get("hostname")
+                port = entry.get("port")
+                if not hostname and not port:
+                    continue
+                normalized.setdefault(local_if, []).append(
+                    {
+                        "hostname": str(hostname) if hostname else None,
+                        "port": str(port) if port else None,
+                        "local_interface": local_if,
+                    }
+                )
+        return normalized
+
+    def _annotate_hops_with_lldp(
+        self,
+        *,
+        next_hops: List[Dict[str, object]],
+        lldp_neighbors: Dict[str, List[Dict[str, Optional[str]]]],
+    ) -> None:
+        """Classify hops as layer2/layer3 based on LLDP evidence."""
+
+        if not next_hops:
+            return
+
+        neighbor_matches: Dict[str, List[Dict[str, Optional[str]]]] = {}
+        for local_if, entries in lldp_neighbors.items():
+            normalized = self._normalize_interface(local_if)
+            if not normalized:
+                continue
+            neighbor_matches.setdefault(normalized, []).extend(entries)
+
+        for hop in next_hops:
+            next_ip = hop.get("next_hop_ip")
+            egress_if = hop.get("egress_interface")
+            hop_type: Optional[str] = None
+            matched_neighbor: Optional[Dict[str, Optional[str]]] = None
+
+            if egress_if:
+                normalized_if = self._normalize_interface(egress_if)
+                candidates = neighbor_matches.get(normalized_if, [])
+                matched_neighbor = self._match_lldp_neighbor(
+                    neighbors=candidates,
+                    next_hop_ip=next_ip,
+                )
+
+            if matched_neighbor:
+                hop_type = "layer2+layer3" if next_ip else "layer2"
+            elif next_ip:
+                hop_type = "layer3"
+
+            if hop_type:
+                hop["hop_type"] = hop_type
+
+    def discover_layer2_path(
+        self,
+        *,
+        device_name: Optional[str],
+        egress_interface: Optional[str],
+        target_ip: Optional[str],
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return serialized Layer2Hop entries from ``device_name`` toward ``target_ip``."""
+
+        if not self._settings.enable_layer2_discovery:
+            return []
+        if not device_name or not egress_interface or not target_ip:
+            return []
+
+        if self._logger:
+            self._logger.debug(
+                "Discovering layer2 path from %s via %s toward %s",
+                device_name,
+                egress_interface,
+                target_ip,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        device = self._data_source.get_device(device_name)
+        if not device or not device.primary_ip:
+            return []
+
+        if self._is_palo_alto_device(device):
+            pa_settings = self._settings.pa_settings()
+            if pa_settings is None:
+                return []
+            client = PaloAltoClient(
+                host=device.primary_ip,
+                verify_ssl=pa_settings.verify_ssl,
+                timeout=10,
+                logger=self._logger,
+            )
+            try:
+                api_key = client.keygen(pa_settings.username, pa_settings.password)
+            except RuntimeError as exc:
+                if self._logger:
+                    self._logger.debug(
+                        f"Palo Alto keygen failed for '{device.name}': {exc}",
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                return []
+            return self._discover_palo_layer2_path(
+                client=client,
+                api_key=api_key,
+                device=device,
+                egress_interface=egress_interface,
+                target_ip=target_ip,
+            )
+
+        helper = self._build_layer2_helper()
+        if helper is None:
+            if self._logger:
+                self._logger.debug(
+                    "Layer2 helper unavailable for %s", device_name, extra={"grouping": "layer2-discovery"}
+                )
+            return []
+
+        napalm_settings = self._settings.napalm_settings()
+        if napalm_settings is None:
+            return []
+        if napalm is None:
+            return []
+
+        driver_name = self._select_napalm_driver(device)
+        for candidate in self._driver_attempts(driver_name):
+            try:
+                driver = napalm.get_network_driver(candidate)
+            except Exception:
+                continue
+            optional_args = self._optional_args_for(candidate)
+            try:
+                with driver(
+                    hostname=device.primary_ip,
+                    username=napalm_settings.username,
+                    password=napalm_settings.password,
+                    optional_args=optional_args,
+                ) as device_conn:
+                    neighbors = self._collect_lldp_neighbors(device_conn, device.name)
+                    hops = helper.discover(
+                        initial_device=device,
+                        initial_conn=device_conn,
+                        initial_driver_name=candidate,
+                        initial_lldp_neighbors=neighbors,
+                        egress_interface=egress_interface,
+                        next_hop_ip=target_ip,
+                    )
+                    if hops:
+                        return [hop.as_dict() for hop in hops]
+            except Exception as exc:  # pragma: no cover - best effort
+                if self._logger:
+                    self._logger.debug(
+                        f"Layer 2 discovery retry failed for '{device.name}': {exc}",
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                continue
+        return []
+
+    def _build_layer2_helper(self) -> Optional[Layer2Discovery]:
+        """Return a cached Layer2Discovery helper if possible."""
+
+        if self._layer2_helper is not None:
+            return self._layer2_helper
+        if not self._settings.enable_layer2_discovery:
+            return None
+        if napalm is None:
+            return None
+
+        helper = Layer2Discovery(
+            napalm_module=napalm,
+            settings=self._settings,
+            data_source=self._data_source,
+            logger=self._logger,
+            select_driver=self._select_napalm_driver,
+            driver_attempts=self._driver_attempts,
+            optional_args_for=self._optional_args_for,
+            collect_lldp_neighbors=self._collect_lldp_neighbors,
+            normalize_interface=self._normalize_interface,
+            normalize_hostname=self._normalize_hostname,
+        )
+        self._layer2_helper = helper
+        return helper
+
+    def _discover_palo_layer2_path(
+        self,
+        *,
+        client: PaloAltoClient,
+        api_key: str,
+        device: DeviceRecord,
+        egress_interface: Optional[str],
+        target_ip: Optional[str],
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return serialized layer-2 hops derived from Palo Alto LLDP/ARP data."""
+
+        if not self._settings.enable_layer2_discovery:
+            return []
+        if self._settings.layer2_max_depth <= 0:
+            return []
+        if not egress_interface or not target_ip:
+            return []
+        egress_norm = self._normalize_interface(egress_interface)
+        if not egress_norm:
+            return []
+
+        neighbors = self._get_palo_lldp_neighbors(client, api_key, device.name)
+
+        arp_table = self._get_palo_arp_table(client, api_key, device.name)
+        arp_entry = arp_table.get(target_ip)
+        if not arp_entry:
+            return []
+        mac_addr = (arp_entry.get("mac") or arp_entry.get("mac_address") or "").strip()
+        if not mac_addr:
+            return []
+        mac_addr_norm = mac_addr.upper()
+
+        arp_if_norm = self._normalize_interface(arp_entry.get("interface"))
+
+        if arp_if_norm and arp_if_norm == egress_norm:
+            if "vlan" not in egress_norm:
+                if self._logger:
+                    self._logger.debug(
+                        "Skipping Palo Alto layer-2 discovery on %s; egress %s matches ARP interface %s",
+                        device.name,
+                        egress_interface,
+                        arp_entry.get("interface"),
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                return []
+
+        interfaces_to_query: List[str] = []
+        interface_aliases: Dict[str, str] = {}
+
+        def _add_interface(alias: Optional[str]) -> None:
+            if not alias:
+                return
+            norm = self._normalize_interface(alias)
+            if not norm:
+                return
+            if norm not in interface_aliases:
+                interface_aliases[norm] = alias
+            if norm not in interfaces_to_query:
+                interfaces_to_query.append(norm)
+
+        _add_interface(egress_interface)
+        if arp_if_norm and arp_entry.get("interface"):
+            _add_interface(arp_entry.get("interface"))
+        elif arp_if_norm:
+            _add_interface(arp_if_norm)
+
+        vlan_members: List[str] = []
+        if egress_norm and "vlan" in egress_norm:
+            vlan_members = self._get_palo_vlan_members(
+                client=client,
+                api_key=api_key,
+                device_name=device.name,
+                vlan_interface=egress_interface,
+            )
+            for member in vlan_members:
+                _add_interface(member)
+            if self._logger and vlan_members:
+                self._logger.debug(
+                    "Augmented VLAN interface %s with members %s for %s",
+                    egress_interface,
+                    vlan_members,
+                    device.name,
+                    extra={"grouping": "layer2-discovery"},
+                )
+
+        chosen_neighbors: Optional[List[Dict[str, Optional[str]]]] = None
+        resolved_gateway_interface: Optional[str] = None
+        for iface in interfaces_to_query:
+            if not iface:
+                continue
+            candidate_list = neighbors.get(iface)
+            if candidate_list:
+                chosen_neighbors = candidate_list
+                resolved_gateway_interface = interface_aliases.get(iface, iface)
+                break
+        if chosen_neighbors is None:
+            if self._logger:
+                self._logger.debug(
+                    "No LLDP neighbors match interfaces %s on %s",
+                    interfaces_to_query,
+                    device.name,
+                    extra={"grouping": "layer2-discovery"},
+                )
+            return []
+        if resolved_gateway_interface is None:
+            resolved_gateway_interface = interface_aliases.get(egress_norm, egress_interface) or egress_interface
+
+        neighbors_for_helper: Dict[str, List[Dict[str, Optional[str]]]] = {
+            key: list(entries or []) for key, entries in neighbors.items()
+        }
+        if egress_norm and egress_norm not in neighbors_for_helper:
+            neighbors_for_helper[egress_norm] = list(chosen_neighbors)
+        if arp_if_norm and arp_if_norm not in neighbors_for_helper and chosen_neighbors:
+            neighbors_for_helper[arp_if_norm] = list(chosen_neighbors)
+        for member in vlan_members:
+            member_norm = self._normalize_interface(member)
+            if (
+                member_norm
+                and member_norm in neighbors
+                and egress_norm
+                and egress_norm not in neighbors_for_helper
+            ):
+                neighbors_for_helper[egress_norm] = list(neighbors[member_norm])
+
+        layer2_helper = self._build_layer2_helper()
+        napalm_settings = self._settings.napalm_settings()
+
+        if layer2_helper and napalm_settings:
+            class _PaloNapalmAdapter:
+                def __init__(self, arp_rows: List[Dict[str, Optional[str]]]) -> None:
+                    self._arp_rows = list(arp_rows or [])
+
+                def get_arp_table(self) -> List[Dict[str, Optional[str]]]:
+                    return list(self._arp_rows)
+
+                def get_mac_address_table(self) -> List[Dict[str, Optional[str]]]:
+                    return []
+
+            adapter = _PaloNapalmAdapter(list(arp_table.values()))
+            try:
+                hops = layer2_helper.discover(
+                    initial_device=device,
+                    initial_conn=adapter,
+                    initial_driver_name="palo_alto",
+                    initial_lldp_neighbors=neighbors_for_helper,
+                    egress_interface=egress_interface,
+                    next_hop_ip=target_ip,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                if self._logger:
+                    self._logger.debug(
+                        "Palo Alto layer-2 helper failed for %s: %s",
+                        device.name,
+                        exc,
+                        extra={"grouping": "layer2-discovery"},
+                    )
+            else:
+                if hops:
+                    serialized: List[Dict[str, Optional[str]]] = []
+                    for index, hop in enumerate(hops):
+                        payload = hop.as_dict()
+                        if index == 0 and resolved_gateway_interface:
+                            payload["gateway_interface"] = resolved_gateway_interface
+                        serialized.append(payload)
+                    return serialized
+
+        neighbor = self._match_lldp_neighbor(chosen_neighbors, target_ip)
+        if not neighbor:
+            neighbor = chosen_neighbors[0]
+        if not neighbor:
+            return []
+
+        neighbor_name = neighbor.get("hostname")
+        if not neighbor_name:
+            neighbor_name = neighbor.get("port") or f"layer2-neighbor-{device.name}"
+        neighbor_name = str(neighbor_name)
+
+        mac_table = self._get_palo_mac_table(client, api_key, device.name)
+        mac_entry = mac_table.get(mac_addr.upper())
+        egress_on_neighbor = None
+        if mac_entry and mac_entry.get("interface"):
+            egress_norm_candidate = self._normalize_interface(mac_entry.get("interface"))
+            egress_on_neighbor = interface_aliases.get(egress_norm_candidate, mac_entry.get("interface"))
+
+        if not egress_on_neighbor and self._logger:
+            self._logger.debug(
+                "Palo Alto layer-2 hop missing downstream egress for %s (MAC %s); leaving egress unset",
+                neighbor_name,
+                mac_addr_norm,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        ingress_on_neighbor = neighbor.get("port")
+        if ingress_on_neighbor and ingress_on_neighbor.isdigit():
+            ingress_on_neighbor = None
+        if not ingress_on_neighbor:
+            ingress_on_neighbor = neighbor.get("port_description") or neighbor.get("port")
+
+        details = (
+            f"Layer 2 hop resolved via LLDP/MAC on '{neighbor_name or 'unknown'}' "
+            f"(MAC {mac_addr_norm})."
+        )
+
+        if self._logger:
+            self._logger.debug(
+                "Derived Palo Alto layer-2 hop (fallback): device=%s ingress=%s egress=%s mac=%s",
+                neighbor_name,
+                ingress_on_neighbor,
+                egress_on_neighbor,
+                mac_addr_norm,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        return [
+            {
+                "device_name": neighbor_name,
+                "ingress_interface": ingress_on_neighbor,
+                "egress_interface": egress_on_neighbor,
+                "mac_address": mac_addr_norm,
+                "gateway_interface": resolved_gateway_interface or egress_interface,
+                "details": details,
+            }
+        ]
+
+    def _classify_palo_alto_hop(
+        self,
+        *,
+        client: PaloAltoClient,
+        api_key: str,
+        device: DeviceRecord,
+        egress_interface: Optional[str],
+        next_hop_ip: Optional[str],
+    ) -> Optional[str]:
+        """Return hop classification based on LLDP/ARP evidence for Palo Alto devices."""
+
+        hop_type: Optional[str] = None
+        lldp_neighbor: Optional[Dict[str, Optional[str]]] = None
+        arp_entry: Optional[Dict[str, Optional[str]]] = None
+        egress_norm = self._normalize_interface(egress_interface)
+
+        if egress_norm:
+            neighbors = self._get_palo_lldp_neighbors(client, api_key, device.name)
+            candidates = neighbors.get(egress_norm, [])
+            lldp_neighbor = self._match_lldp_neighbor(candidates, next_hop_ip)
+
+        if next_hop_ip:
+            arp_table = self._get_palo_arp_table(client, api_key, device.name)
+            candidate = arp_table.get(next_hop_ip)
+            if candidate:
+                if egress_norm:
+                    candidate_norm = self._normalize_interface(candidate.get("interface"))
+                    if candidate_norm and candidate_norm != egress_norm:
+                        candidate = None
+                arp_entry = candidate
+
+        if lldp_neighbor:
+            hop_type = "layer2+layer3" if next_hop_ip else "layer2"
+        elif arp_entry:
+            hop_type = "layer2+layer3"
+        elif next_hop_ip:
+            hop_type = "layer3"
+
+        return hop_type
+
+    def _get_palo_lldp_neighbors(
+        self,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+    ) -> Dict[str, List[Dict[str, Optional[str]]]]:
+        """Return cached LLDP neighbors for the Palo Alto device."""
+
+        cache_key = f"{device_name}::lldp"
+        cached = self._palo_lldp_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            raw_neighbors = client.get_lldp_neighbors(api_key)
+        except RuntimeError as exc:
+            raw_neighbors = {}
+            if self._logger:
+                self._logger.debug(
+                    f"Palo Alto LLDP retrieval failed for '{device_name}': {exc}",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+
+        normalized: Dict[str, List[Dict[str, Optional[str]]]] = {}
+        for local_if, entries in (raw_neighbors or {}).items():
+            normalized_if = self._normalize_interface(local_if)
+            if not normalized_if:
+                continue
+            sanitized: List[Dict[str, Optional[str]]] = []
+            for entry in entries or []:
+                remote_port = entry.get("port")
+                port_description = entry.get("port_description")
+                sanitized.append(
+                    {
+                        "hostname": entry.get("hostname"),
+                        "port": port_description or remote_port,
+                        "port_id": remote_port,
+                        "port_description": port_description,
+                        "management_ip": entry.get("management_ip"),
+                        "local_interface": entry.get("local_interface") or local_if,
+                    }
+                )
+            if sanitized:
+                normalized[normalized_if] = sanitized
+
+        self._palo_lldp_cache[cache_key] = normalized
+        return normalized
+
+    def _get_palo_mac_table(
+        self,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Return cached MAC address table entries keyed by MAC."""
+
+        cache_key = f"{device_name}::mac"
+        cached = self._palo_mac_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            entries = client.get_mac_table(api_key)
+        except RuntimeError as exc:
+            entries = []
+            if self._logger:
+                self._logger.debug(
+                    f"Palo Alto MAC retrieval failed for '{device_name}': {exc}",
+                    extra={"grouping": "layer2-discovery"},
+                )
+
+        table: Dict[str, Dict[str, Optional[str]]] = {}
+        for entry in entries or []:
+            mac = entry.get("mac")
+            if not mac:
+                continue
+            table[mac.upper()] = {
+                "mac": mac,
+                "interface": entry.get("interface"),
+                "vlan": entry.get("vlan"),
+                "age": entry.get("age"),
+            }
+
+        self._palo_mac_cache[cache_key] = table
+        return table
+
+    def _get_palo_vlan_members(
+        self,
+        *,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+        vlan_interface: str,
+    ) -> List[str]:
+        """Return member interfaces for the VLAN carrying ``vlan_interface``."""
+
+        cache_key = f"{device_name}::vlan::{vlan_interface}"
+        cached = self._palo_vlan_member_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        members = client.vlan_members_for_interface(api_key, vlan_interface)
+        if not members:
+            vlan_iface_norm = self._normalize_interface(vlan_interface) or vlan_interface.lower()
+            iface_token = vlan_iface_norm.replace("vlan.", "").replace("vlan-", "")
+            for candidate in (iface_token, f"vlan.{iface_token}", f"vlan-{iface_token}"):
+                if candidate == vlan_interface or not candidate:
+                    continue
+                members = client.vlan_members_for_interface(api_key, candidate)
+                if members:
+                    break
+
+        if not members and self._logger:
+            self._logger.debug(
+                "VLAN member lookup failed for '%s' interface '%s'",
+                device_name,
+                vlan_interface,
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        self._palo_vlan_member_cache[cache_key] = members
+        return members
+
+    def _get_palo_arp_table(
+        self,
+        client: PaloAltoClient,
+        api_key: str,
+        device_name: str,
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Return cached ARP table entries keyed by IP."""
+
+        cache_key = f"{device_name}::arp"
+        cached = self._palo_arp_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            entries = client.get_arp_table(api_key)
+        except RuntimeError as exc:
+            entries = []
+            if self._logger:
+                self._logger.debug(
+                    f"Palo Alto ARP retrieval failed for '{device_name}': {exc}",
+                    extra={"grouping": "next-hop-discovery"},
+                )
+
+        table: Dict[str, Dict[str, Optional[str]]] = {}
+        for entry in entries or []:
+            ip_addr = entry.get("ip")
+            if not ip_addr:
+                continue
+            table[ip_addr] = {
+                "ip": ip_addr,
+                "interface": entry.get("interface"),
+                "mac": entry.get("mac"),
+                "vlan": entry.get("vlan"),
+                "age": entry.get("age"),
+            }
+
+        self._palo_arp_cache[cache_key] = table
+        return table
+
+    def _match_lldp_neighbor(
+        self,
+        neighbors: Optional[List[Dict[str, Optional[str]]]],
+        next_hop_ip: Optional[str],
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """Return matching LLDP neighbor for the next hop device, if any."""
+
+        if not neighbors:
+            return None
+
+        target_name: Optional[str] = None
+        if next_hop_ip:
+            target_name = self._lookup_device_name_for_ip(next_hop_ip)
+
+        if target_name:
+            normalized_target = self._normalize_hostname(target_name)
+            for neighbor in neighbors:
+                hostname = neighbor.get("hostname")
+                if hostname and self._normalize_hostname(hostname) == normalized_target:
+                    return neighbor
+            return None
+
+        if next_hop_ip:
+            return None
+        return neighbors[0]
+
+    def _lookup_device_name_for_ip(self, ip_addr: str) -> Optional[str]:
+        """Return Nautobot device name for IP, with caching."""
+
+        if ip_addr in self._ip_device_cache:
+            return self._ip_device_cache[ip_addr]
+
+        device_record = self._data_source.get_ip_address(ip_addr)
+        device_name = device_record.device_name if device_record else None
+        self._ip_device_cache[ip_addr] = device_name
+        return device_name
+
+    def _is_palo_alto_device(self, device: DeviceRecord) -> bool:
+        """Return True if ``device`` appears to be a Palo Alto platform."""
+
+        for candidate in (device.platform_slug, device.platform_name):
+            if isinstance(candidate, str):
+                token = candidate.lower()
+                if any(indicator in token for indicator in self._PALO_ALTO_INDICATORS):
+                    return True
+        return False
+
+    @staticmethod
+    def _normalize_hostname(name: Optional[str]) -> Optional[str]:
+        if not isinstance(name, str):
+            return None
+        token = name.strip().lower()
+        if not token:
+            return None
+        return token.split(".")[0]
+
+    @staticmethod
+    def _normalize_interface(name: Optional[str]) -> Optional[str]:
+        if not isinstance(name, str):
+            return None
+        token = name.strip().lower().replace(" ", "")
+        return token or None
