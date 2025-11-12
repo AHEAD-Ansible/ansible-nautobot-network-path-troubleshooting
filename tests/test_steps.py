@@ -113,16 +113,21 @@ def test_input_validation_success(default_settings, prefix_record, source_ip_rec
     assert result.source_prefix == prefix_record
     assert result.source_record == source_ip_record
     assert result.is_host_ip is False
+    assert result.source_found is True
 
 
 def test_input_validation_missing_ip(default_settings, prefix_record):
     data_source = FakeDataSource(ip_records={}, prefix_record=prefix_record)
     step = InputValidationStep(data_source)
 
-    with pytest.raises(InputValidationError) as excinfo:
-        step.run(default_settings)
+    result = step.run(default_settings)
 
-    assert "Source IP 10.10.10.10" in str(excinfo.value)
+    assert result.source_found is False
+    assert result.source_record.device_name is None
+    assert result.source_record.interface_name is None
+    assert result.source_record.prefix_length == 24
+    assert result.source_prefix == prefix_record
+    assert result.is_host_ip is False
 
 
 def test_input_validation_missing_prefix(default_settings, source_ip_record):
@@ -169,6 +174,29 @@ def test_gateway_custom_field(prefix_record, source_ip_record):
     assert result.method == "custom_field"
     assert result.gateway == gateway_record
     assert "network_gateway" in (result.details or "")
+
+
+def test_gateway_custom_field_source_missing(default_settings, prefix_record):
+    gateway_record = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="gw-1",
+        interface_name="Gig0/0",
+    )
+    data_source = FakeDataSource(
+        ip_records={},
+        prefix_record=prefix_record,
+        gateway_record=gateway_record,
+    )
+
+    validation = InputValidationStep(data_source).run(default_settings)
+
+    assert validation.source_found is False
+    step = GatewayDiscoveryStep(data_source, "network_gateway")
+    result = step.run(validation)
+
+    assert result.method == "custom_field"
+    assert result.gateway == gateway_record
 
 
 def test_gateway_custom_field_hsrp_fallback(prefix_record, source_ip_record):
@@ -240,7 +268,8 @@ def test_gateway_fallback_to_lowest_host(prefix_record, source_ip_record):
 
     assert result.method == "lowest_host"
     assert result.gateway == fallback_gateway
-    assert data_source.get_ip_address("10.10.10.1") == fallback_gateway
+    assert "fallback" in (result.details or "").lower()
+    assert "gw-fallback" in (result.details or "")
 
 
 def test_gateway_lowest_host_resolves_redundancy(prefix_record, source_ip_record):
@@ -309,14 +338,21 @@ def test_gateway_lowest_host_requires_existing_ip(prefix_record, source_ip_recor
     data_source = FakeDataSource(ip_records={}, prefix_record=prefix_record, gateway_record=None)
     step = GatewayDiscoveryStep(data_source, "network_gateway")
 
-    with pytest.raises(GatewayDiscoveryError):
-        step.run(validation)
+    result = step.run(validation)
+
+    assert result.method == "lowest_host"
+    assert result.gateway.address == "10.10.10.1"
+    assert result.gateway.device_name is None
+    assert "not present" in (result.details or "").lower()
+    assert "fallback" in (result.details or "").lower()
 
 
 def build_validation_result(
     prefix: PrefixRecord,
     record: IPAddressRecord,
     is_host: bool,
+    *,
+    source_found: bool = True,
 ) -> InputValidationResult:
     return InputValidationResult(
         source_ip=record.address,
@@ -324,6 +360,7 @@ def build_validation_result(
         source_record=record,
         source_prefix=prefix,
         is_host_ip=is_host,
+        source_found=source_found,
     )
 
 

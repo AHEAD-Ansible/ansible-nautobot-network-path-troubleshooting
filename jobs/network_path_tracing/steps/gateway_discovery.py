@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..exceptions import GatewayDiscoveryError
 from ..interfaces.nautobot import (

@@ -19,6 +19,7 @@ from .steps.input_validation import InputValidationResult, InputValidationStep
 from .steps.next_hop_discovery import NextHopDiscoveryResult, NextHopDiscoveryStep
 from .graph import NetworkPathGraph, build_pyvis_network
 from .steps.path_tracing import PathHop, Path, PathTracingResult, PathTracingStep
+from .utils import resolve_target_to_ipv4
 
 
 __all__ = [
@@ -55,4 +56,5 @@ __all__ = [
     "PathTracingStep",
     "NetworkPathGraph",
     "build_pyvis_network",
+    "resolve_target_to_ipv4",
 ]

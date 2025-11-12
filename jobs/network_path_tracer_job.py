@@ -196,7 +196,6 @@ class NetworkPathTracerJob(Job):
                 f"Normalized settings: source_ip={settings.source_ip}, "
                 f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
             )
-        )
 
         if ping_endpoints:
             self.logger.info("Pinging source and destination endpoints before tracing.")
@@ -210,7 +209,6 @@ class NetworkPathTracerJob(Job):
         next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
         path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
 
-        try:
             # Step 1: Validate inputs
             self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
@@ -263,6 +261,8 @@ class NetworkPathTracerJob(Job):
             result_payload = {
                 "status": "success",
                 "source": {
+                    "input": source_input,
+                    "found_in_nautobot": validation.source_found,
                     "address": validation.source_ip,
                     "prefix_length": validation.source_record.prefix_length,
                     "prefix": validation.source_prefix.prefix,
@@ -294,8 +294,13 @@ class NetworkPathTracerJob(Job):
             }
 
             destination_summary = self._build_destination_summary(path_result.paths)
+            destination_payload: Dict[str, Any] = {
+                "input": destination_input,
+                "found_in_nautobot": destination_found,
+            }
             if destination_summary:
-                result_payload["destination"] = destination_summary
+                destination_payload.update(destination_summary)
+            result_payload["destination"] = destination_payload
 
             if visualization_attached:
                 result_payload["visualization"] = "See attached 'network_path_trace.html' for interactive graph."

@@ -780,6 +780,7 @@ class PathTracingStep:
             ),
             source_prefix=PrefixRecord(prefix=""),
             is_host_ip=False,
+            source_found=False,
         )
 
     @staticmethod
