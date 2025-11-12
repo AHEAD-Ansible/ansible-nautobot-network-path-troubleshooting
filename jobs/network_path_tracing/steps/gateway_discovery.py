@@ -55,13 +55,20 @@ class GatewayDiscoveryStep:
                 redundant_members=members,
             )
 
-        fallback_record = self._fallback_to_lowest_host(validation)
+        fallback_record, from_nautobot = self._fallback_to_lowest_host(validation)
         if fallback_record:
             original_device = fallback_record.device_name
             adjusted_record, _, _, members = self._resolve_gateway_via_redundancy(fallback_record)
-            details = "Used lowest usable IP address as the gateway fallback."
+            detail_parts = ["Used lowest usable IP address as the gateway fallback."]
+            if not from_nautobot:
+                detail_parts.append("Address not present in Nautobot.")
             if members or (not original_device and adjusted_record.device_name):
-                details += " Resolved gateway interface via interface redundancy groups."
+                detail_parts.append("Resolved gateway interface via interface redundancy groups.")
+            elif adjusted_record.device_name and adjusted_record.interface_name:
+                detail_parts.append(
+                    f"Resolved to device '{adjusted_record.device_name}' interface '{adjusted_record.interface_name}'."
+                )
+            details = " ".join(detail_parts)
             return GatewayDiscoveryResult(
                 found=True,
                 method="lowest_host",
@@ -76,16 +83,28 @@ class GatewayDiscoveryStep:
 
     def _fallback_to_lowest_host(
         self, validation: InputValidationResult
-    ) -> Optional[IPAddressRecord]:
+    ) -> tuple[Optional[IPAddressRecord], bool]:
         """Fall back to the lowest usable host IP in the prefix."""
         network = ipaddress.ip_network(validation.source_prefix.prefix)
         if network.version == 4 and network.prefixlen >= 30:
-            return None
+            return None, False
         try:
             first_host = next(network.hosts())
         except StopIteration:
-            return None
-        return self._data_source.get_ip_address(str(first_host))
+            return None, False
+        ip_str = str(first_host)
+        record = self._data_source.get_ip_address(ip_str)
+        if record:
+            return record, True
+        return (
+            IPAddressRecord(
+                address=ip_str,
+                prefix_length=network.prefixlen,
+                device_name=None,
+                interface_name=None,
+            ),
+            False,
+        )
 
     def _resolve_gateway_via_redundancy(
         self, gateway_record: IPAddressRecord
