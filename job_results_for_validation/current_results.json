@@ -177,9 +177,5 @@
         "prefix_length": 24
     },
     "status": "success",
-    "destination": {
-        "input": "10.251.0.205",
-        "found_in_nautobot": true
-    },
     "visualization": "See attached 'network_path_trace.html' for interactive graph."
 }

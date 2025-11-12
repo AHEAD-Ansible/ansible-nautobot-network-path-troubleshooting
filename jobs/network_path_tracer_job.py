@@ -196,6 +196,7 @@ class NetworkPathTracerJob(Job):
                 f"Normalized settings: source_ip={settings.source_ip}, "
                 f"destination_ip={settings.destination_ip}, secrets_group={secrets_group}"
             )
+        )
 
         if ping_endpoints:
             self.logger.info("Pinging source and destination endpoints before tracing.")
@@ -209,10 +210,12 @@ class NetworkPathTracerJob(Job):
         next_hop_step = NextHopDiscoveryStep(data_source, settings, logger=self.logger)  # Pass Job's logger
         path_tracing_step = PathTracingStep(data_source, settings, next_hop_step, logger=self.logger)
 
+        try:
             # Step 1: Validate inputs
             self.logger.info(msg="Starting input validation")
             validation = validation_step.run(settings)
-            if not getattr(validation, "source_found", True):
+            source_found = getattr(validation, "source_found", True)
+            if not source_found:
                 self.logger.warning(
                     msg=(
                         f"Source IP {normalized_source} not found in Nautobot; "
@@ -222,7 +225,8 @@ class NetworkPathTracerJob(Job):
             self.logger.success("Input validation completed successfully")
 
             destination_record = data_source.get_ip_address(normalized_destination)
-            if destination_record is None:
+            destination_found = destination_record is not None
+            if not destination_found:
                 self.logger.warning(
                     msg=(
                         f"Destination IP {normalized_destination} not found in Nautobot; "
@@ -262,7 +266,7 @@ class NetworkPathTracerJob(Job):
                 "status": "success",
                 "source": {
                     "input": source_input,
-                    "found_in_nautobot": validation.source_found,
+                    "found_in_nautobot": source_found,
                     "address": validation.source_ip,
                     "prefix_length": validation.source_record.prefix_length,
                     "prefix": validation.source_prefix.prefix,
