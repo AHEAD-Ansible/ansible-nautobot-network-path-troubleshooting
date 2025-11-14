@@ -1,151 +1,116 @@
-# Administrators Guide
+# Developer & Administrator Guide
 
-This document gives Nautobot administrators a high-level but actionable view of
-the network path tracing job, the supporting modules, and how execution flows
-between them. Use it to understand which component owns each responsibility
-and where to look when troubleshooting or extending the workflow.
+This document is aimed at Nautobot operators and developers who maintain or extend the Network Path Tracer job. It explains how the repository is structured, how the execution flow works, and which modules own the major responsibilities.
 
-## Top-Level Layout
+---
+
+## Repository Layout
 
 ```
 jobs/
+├── network_path_tracer_job.py      # Nautobot Job entry point
 ├── __init__.py
-├── network_path_tracer_job.py        # Nautobot Job entry point
-└── network_path_tracing/             # Reusable toolkit consumed by the job
-    ├── __init__.py                   # Public package exports
-    ├── config.py                     # Runtime configuration helpers
-    ├── cli.py                        # (Optional) CLI utilities
-    ├── exceptions.py                 # Domain-specific exception classes
-    ├── interfaces/                   # Data source abstractions
-    │   ├── nautobot.py               # Protocol & simple dataclasses
-    │   ├── nautobot_api.py           # REST API implementation
-    │   ├── nautobot_orm.py           # Django ORM implementation used by the job
-    │   └── palo_alto.py              # Palo Alto XML API helper
-    └── steps/                        # Discrete workflow steps
-        ├── input_validation.py
-        ├── gateway_discovery.py
-        ├── next_hop_discovery.py
-        └── path_tracing.py
+└── network_path_tracing/
+    ├── __init__.py                 # Public exports
+    ├── apps.py / __init__.py       # Plugin metadata
+    ├── config.py                   # Environment + runtime settings
+    ├── cli.py                      # Optional CLI wrapper
+    ├── exceptions.py               # Domain-specific errors
+    ├── graph/                      # NetworkX + PyVis helpers
+    ├── interfaces/                 # Nautobot data sources + device clients
+    ├── steps/                      # Validation, gateway, next-hop, path tracing
+    └── utils.py                    # Shared helpers (hostname resolver)
 
 tests/
-└── test_steps.py                     # Step-level unit tests
+├── test_steps.py                   # Step-level unit tests
+├── test_utils.py                   # Utility tests
+├── test_interfaces_api.py          # Nautobot API adapter tests
+└── *_smoke.py / *_probe.py         # Optional integration / lab scripts
 ```
 
-## Execution Flow
+---
 
-1. **Job registration** – `jobs/network_path_tracer_job.py` defines
-   `NetworkPathTracerJob` and registers it with Nautobot via the
-   `@register_jobs` decorator. The job exposes two Nautobot form variables:
-   `source_ip` and `destination_ip`.
+## Runtime Flow
 
-2. **Run invocation** – When Nautobot runs the job, `NetworkPathTracerJob.run()`
-   orchestrates the entire workflow:
-   - Normalizes the inputs (`_to_address_string()`), logs startup metadata and
-     unexpected kwargs, and instantiates `NetworkPathSettings` from
-     `config.py` (capturing the gateway custom field key, API credentials, etc.).
-   - Accepts either IPv4 literals or hostnames for source/destination, resolving
-     hostnames via the Nautobot system resolver (IPv4 only) and preserving the
-     original input alongside the resolved address in the job results.
-   - If the source IP/host is absent from Nautobot IPAM, the job now performs
-     prefix-based gateway discovery and continues with reduced metadata,
-     marking the source as not found in the result payload.
-   - Creates the shared data source (`NautobotORMDataSource`) and the pipeline
-     steps (`InputValidationStep`, `GatewayDiscoveryStep`,
-     `NextHopDiscoveryStep`, `PathTracingStep`).
-   - Runs each step in order, propagating the returned domain models
-     (`InputValidationResult`, `GatewayDiscoveryResult`, `PathTracingResult`).
-   - Builds the final payload, stores it on the `JobResult` (via
-     `_store_path_result()`), and marks completion status.
-   - Funnels error conditions through `_fail_job()` which logs with grouping
-     metadata, sets job status to failure, and re-raises a `ValueError` so the
-     exception is visible in Nautobot.
+1. **Registration** – `NetworkPathTracerJob` is registered via `@register_jobs`. Nautobot exposes the form variables defined at the top of the class (`source_ip`, `destination_ip`, `secrets_group`, etc.).
 
-3. **Result storage** – `_store_path_result()` checks for a JSON custom field
-   named `network_path_trace_results` on the `JobResult` model. If present, the
-   code prefers `job_result.cf[...]` + `validated_save()` (Nautobot 2.x
-   approach); otherwise it falls back to mutating `custom_field_data`. When the
-   custom field is missing (or the lookup fails), the payload is written to the
-   job log for later inspection.
+2. **Execution** – `NetworkPathTracerJob.run()` orchestrates the workflow:
+   - Validates and normalizes user inputs via `_to_address_string()` and `resolve_target_to_ipv4()`.
+   - Retrieves credentials from the selected `SecretsGroup` and builds `NetworkPathSettings` (using `dataclasses.replace()` to inject username/password everywhere).
+   - Instantiates `NautobotORMDataSource`, `InputValidationStep`, `GatewayDiscoveryStep`, `NextHopDiscoveryStep`, and `PathTracingStep`.
+   - Executes the steps sequentially, logging each phase with structured metadata (`grouping=` arguments on `self.logger`).
+   - Calls `_store_path_result()` to persist the payload in the `network_path_trace_results` custom field if it exists, or logs the payload otherwise.
+   - On any error, `_fail_job()` records the failure, sets the `JobResult` to `FAILED`, and returns a safe empty dict to Nautobot.
 
-## Component Responsibilities
+3. **Result Shape** – The job returns a dict with `source`, `gateway`, `paths[]`, `issues`, and optional `visualization`. This mirrors what the CLI emits for consistency.
 
-### Configuration (`network_path_tracing/config.py`)
-`NetworkPathSettings` locks together source/destination IPs, the custom field
-key, and optional integrations (Nautobot API, Palo Alto, NAPALM). Each nested
-settings dataclass exposes `is_configured()` so callers can gate optional
-features.
+---
 
-### Interfaces (`network_path_tracing/interfaces/`)
-- `nautobot.py` defines lightweight dataclasses (`IPAddressRecord`,
-  `PrefixRecord`, `DeviceRecord`) plus a `NautobotDataSource` protocol used by
-  the steps.
-- `nautobot_orm.py` is the concrete implementation used by the job. It resolves
-  IPs, prefixes, devices, and custom field tagged gateways directly via the
-  Nautobot ORM. Key behaviour:
-  - `get_ip_address()` fetches the IP and resolves attached interfaces or
-    assigned objects to determine the device/interface names.
-  - `get_most_specific_prefix()` and `find_gateway_ip()` rely on Nautobot 2.x
-    fields (`network__net_contains_or_equals`, `_custom_field_data__…`).
-  - `get_device()` extracts platform metadata defensively, working across
-    various Nautobot platform schemas.
-- `nautobot_api.py` provides an API-based data source (unused by the current
-  job but kept for CLI tooling).
-- `palo_alto.py` encapsulates the XML API calls used when the platform slug is
-  `panos`.
+## Key Modules, Classes, and Functions
 
-### Workflow Steps (`network_path_tracing/steps/`)
-Each step returns a dataclass capturing the outcome and is designed to be
-independently testable.
+### `jobs/network_path_tracer_job.py`
+- `NetworkPathTracerJob` – Main Nautobot job.
+  - `run()` – performs orchestration described above.
+  - `_to_address_string()` – trims whitespace, strips CIDR suffixes, and lowercases hostnames for consistent logging.
+  - `_log_hostname_resolution()` – logs when hostnames resolve to different IPv4 addresses.
+  - `_store_path_result()` – writes the result dict into `JobResult.cf["network_path_trace_results"]` when the JSON custom field exists; falls back to `custom_field_data` or log output otherwise.
+  - `_fail_job(reason)` – central failure handler that logs, updates the `JobResult`, and ensures Nautobot surfaces the error message.
 
-- `input_validation.py` – Validates the source IP, finds the containing prefix,
-  and records whether the IP matches the prefix (host vs. subnet). Raises
-  `InputValidationError` on failure.
-- `gateway_discovery.py` – Discovers the first hop for the path by checking for
-  (a) host IPs, (b) a custom field flagged gateway, or (c) the lowest host in
-  the prefix. Raises `GatewayDiscoveryError` if it cannot resolve a gateway.
-- `next_hop_discovery.py` – Uses platform-specific logic:
-  - Palo Alto: authenticates, determines the virtual router, and performs FIB
-    or routing table lookups.
-  - Other platforms: calls `napalm.get_network_driver()` and logs the chosen
-    driver to the Nautobot job log (`grouping="next-hop-discovery"`). It
-    normalizes the structure returned by `get_route_to()` so both list and dict
-    formats are supported, returning a `NextHopDiscoveryResult` with any
-    next-hop IP/interface pairs.
-  - Raises `NextHopDiscoveryError` for missing devices, credentials, or lookup
-    failures.
-- `path_tracing.py` – Recursively traces the path toward the destination using
-  repeated `NextHopDiscoveryStep` invocations. It keeps track of seen devices,
-  hop count limits, and failure thresholds to avoid loops. The result consists
-  of one or more `Path` objects with ordered `PathHop` entries and any
-  cross-path issues.
+### `jobs/network_path_tracing/config.py`
+- `NetworkPathSettings` – Immutable dataclass that bundles the user input, custom-field name, optional Nautobot API settings, Palo Alto, NAPALM, and F5 credentials, plus feature toggles (`enable_layer2_discovery`, `layer2_max_depth`).
+- Helper methods (`api_settings()`, `pa_settings()`, etc.) guard optional integrations by returning `None` when credentials are missing.
 
-### Exceptions (`network_path_tracing/exceptions.py`)
-Simple RuntimeError subclasses (`InputValidationError`,
-`GatewayDiscoveryError`, `NextHopDiscoveryError`, `PathTracingError`) used to
-signal step-specific failures up the stack.
+### `jobs/network_path_tracing/interfaces`
+- `nautobot.py` – Defines the shared dataclasses (`IPAddressRecord`, `PrefixRecord`, `DeviceRecord`, `RedundancyMember`, etc.) and the `NautobotDataSource` protocol.
+- `nautobot_orm.py` – Concrete data source for in-app execution:
+  - `get_ip_address()` / `_build_ip_record()` – fetch IPs via ORM and enrich them with device/interface info.
+  - `get_most_specific_prefix()` – uses `network__net_contains_or_equals` to grab the containing prefix.
+  - `find_gateway_ip()` – fetches the IP tagged with the configured custom field.
+  - `resolve_redundant_gateway()` – maps interface redundancy groups (HSRP/VRRP) to the preferred member.
+- `nautobot_api.py` – REST API data source used by the CLI when `--data-source api` is selected.
+- `palo_alto.py` / `f5_bigip.py` – Thin clients for vendor APIs. The `NextHopDiscoveryStep` determines when to construct these based on the device platform slug/name.
 
-### Package Export (`network_path_tracing/__init__.py`)
-Collects the most-used classes (settings, interfaces, steps, exceptions) so
-they can be imported as `from network_path_tracing import …` by both the job
-and the tests.
+### `jobs/network_path_tracing/steps`
+- `InputValidationStep.run()` – normalizes IPs, ensures a prefix exists, and returns `InputValidationResult`.
+- `GatewayDiscoveryStep.run()` – attempts host mode (`/32`), the tagged gateway, then `_fallback_to_lowest_host()`. `GatewayDiscoveryResult` also carries redundancy membership details.
+- `NextHopDiscoveryStep.run()` – fetches the gateway device, caches lookups per destination, and dispatches to:
+  - `_run_palo_alto_lookup()` – calls `PaloAltoClient.keygen()`, `get_virtual_router_for_interface()`, and merges the XML FIB/route lookup outputs.
+  - `_run_f5_lookup()` – queries F5 TMOS APIs to map pools and virtual servers to interfaces (via `F5Client`).
+  - `_run_napalm_lookup()` – invokes `napalm.get_network_driver()`, runs `open()` with the supplied credentials, and normalizes `get_route_to()` output into lists of `{next_hop, outgoing_interface}` dicts.
+  - On success returns `NextHopDiscoveryResult(found=True, next_hops=[...])`; raises `NextHopDiscoveryError` otherwise.
+- `PathTracingStep.run()` – BFS-based loop that:
+  - Builds a `NetworkPathGraph` to track nodes and edges.
+  - Seeds the queue with the gateway, then repeatedly calls the next-hop step, branching when multiple next hops exist.
+  - Uses helper methods like `_process_state()`, `_record_issue()`, `_finalize_path()`, `_node_id_for_device()`, `_collect_source_layer2_path()`, and `_integrate_redundant_gateways()` to manage traversal, dedupe loops, and embed layer-2 context if requested.
+  - Returns `PathTracingResult(paths=[Path(...) ...], issues=[...], graph=NetworkPathGraph)`.
 
-## Testing Strategy
+### `jobs/network_path_tracing/graph`
+- `NetworkPathGraph` – Wrapper around `networkx.MultiDiGraph` with helpers for tagging start/destination nodes, merging attributes, and serializing nodes/edges to JSON.
+- `build_pyvis_network(graph)` – Renders the graph via PyVis for interactive viewing. Honors layer-2 edges (dashed) and color-codes start/source/destination nodes.
 
-- `tests/test_steps.py` isolates the workflow steps using lightweight fakes and
-  monkeypatching. The suite covers input validation, gateway discovery, path
-  tracing scenarios (success, blackhole, multi-hop), and NAPALM route parsing.
-  The job itself is not executed under pytest, avoiding the need for a full
-  Nautobot runtime.
+### `jobs/network_path_tracing/utils.py`
+- `resolve_target_to_ipv4(value, field_label)` – Accepts IPs or hostnames, enforces IPv4-only behavior, and raises `InputValidationError` on missing/invalid inputs.
 
-## Operational Notes
+### `jobs/network_path_tracing/cli.py`
+- `build_parser()` – Command-line arguments for selecting data source, IPs, visualization output, and NAPALM credentials.
+- `select_data_source()` – Returns either `NautobotORMDataSource` or `NautobotAPIDataSource`.
+- `run_steps()` – Mirrors `NetworkPathTracerJob.run()` but prints progress to stdout and optionally writes a PyVis HTML file. Useful for reproducing issues outside Nautobot.
+- `main()` – CLI entry point when executing the module directly.
 
-- Ensure a JSON custom field named `network_path_trace_results` is assigned to
-  `extras.JobResult`. Without it, the job will log results instead of persisting
-  them.
-- NAPALM credentials (`NAPALM_USERNAME`, `NAPALM_PASSWORD`) and platform slug
-  values determine whether next-hop discovery can interrogate network devices.
-- Optional integrations (REST API, Palo Alto) are toggled via environment
-  variables consumed by `NetworkPathSettings`.
+---
 
-Administrators can now navigate the codebase confidently, understand where
-each piece fits, and pinpoint the module responsible for any given behaviour.
+## Extending the Workflow
+
+- **Adding new device-specific logic** – Extend `NextHopDiscoveryStep` with additional platform detection (e.g., Juniper) and implement a helper similar to `_run_palo_alto_lookup()`. Keep the detection case-insensitive and rely on platform slug/name substrings.
+- **Changing default behavior** – Update constants in `config.py` (`_DEFAULT_SOURCE_IP`, `_DEFAULT_GATEWAY_CUSTOM_FIELD`, etc.). Any new settings should use the `_env_flag()/ _env_int()` helpers for consistency.
+- **Additional graph metadata** – `NetworkPathGraph.ensure_node()` and `add_edge()` accept arbitrary attributes; update `_process_state()` or `_add_source_node()` in `PathTracingStep` to annotate nodes for downstream visualization consumers.
+
+---
+
+## Operational Considerations
+
+- Create the `network_path_trace_results` JSON custom field on `extras.JobResult` so `_store_path_result()` can persist structured data.
+- Ensure platform slugs map cleanly to NAPALM drivers; `NextHopDiscoveryStep._is_palo_alto_device()` and `_NXOS_DRIVERS` are good references for how detection is implemented.
+- When running outside Nautobot (CLI or smoke tests), use the provided stubs for Django and NetworkX if you don’t have a full Nautobot environment available—see `tests/gateway_source_l2_smoke.py` for an example.
+
+For details on unit tests, smoke scripts, and how to run them, refer to `TESTING.md`.
