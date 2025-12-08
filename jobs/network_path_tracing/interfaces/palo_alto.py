@@ -256,6 +256,10 @@ class PaloAltoClient:
         """Perform an HTTP GET request."""
         return self.session.get(url, timeout=self.timeout)
 
+    def _show(self, url: str) -> requests.Response:
+        """Perform an HTTP SHOW request."""
+        return self.session.show(url, timeout=self.timeout)
+
     def keygen(self, username: str, password: str) -> str:
         """Generate an API key for Palo Alto."""
         url = (
@@ -348,12 +352,24 @@ class PaloAltoClient:
     def _build_config_url(self, api_key: str, xpath: str) -> str:
         params = {
             "type": "config",
-            "action": "show",
+            "action": "get",
             "xpath": xpath,
             "key": api_key,
         }
         self._inject_vsys_param(params)
         query = urllib.parse.urlencode(params)
+        sanitized_params = dict(params)
+        if "key" in sanitized_params:
+            sanitized_params["key"] = "***redacted***"
+        sanitized_query = urllib.parse.urlencode(sanitized_params)
+        if self.logger:
+            self.logger.debug(
+                "Palo Alto config request type=%s action=%s url=%s",
+                params.get("type"),
+                params.get("action"),
+                f"https://{self.host}/api/?{sanitized_query}",
+                extra={"grouping": "next-hop-discovery"},
+            )
         return f"https://{self.host}/api/?{query}"
 
     def _inject_vsys_param(self, params: Dict[str, str]) -> None:

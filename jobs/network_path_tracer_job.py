@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import subprocess
 from dataclasses import replace
 from typing import Any, Dict, Optional
@@ -49,7 +50,14 @@ class NetworkPathTracerJob(Job):
         has_sensitive_variables = False
         read_only = True
         dryrun_default = False  # Explicit for clarity, though read_only
-        field_order = ["source_ip", "destination_ip", "secrets_group", "enable_layer2_discovery", "ping_endpoints"]
+        field_order = [
+            "source_ip",
+            "destination_ip",
+            "secrets_group",
+            "enable_layer2_discovery",
+            "ping_endpoints",
+            "enable_debug_logging",
+        ]
         # soft_time_limit / time_limit could be added if long-running
 
     source_ip = StringVar(
@@ -76,6 +84,10 @@ class NetworkPathTracerJob(Job):
         description="Ping the source and destination before tracing to refresh ARP/ND tables.",
         default=False,
     )
+    enable_debug_logging = BooleanVar(
+        description="Include debug-level log messages in the job output for troubleshooting.",
+        default=False,
+    )
 
     def run(
         self,
@@ -85,6 +97,7 @@ class NetworkPathTracerJob(Job):
         secrets_group: SecretsGroup,
         enable_layer2_discovery: bool = True,
         ping_endpoints: bool = False,
+        enable_debug_logging: bool = False,
         **kwargs,
     ) -> dict:
         """Execute the full network path tracing workflow.
@@ -108,9 +121,21 @@ class NetworkPathTracerJob(Job):
         Best practices: Use self.log_* for traceability. Set JobResult status/data.
         Raise exceptions for failures (Nautobot captures tracebacks in JobResult).
         """
+        log_level = logging.DEBUG if enable_debug_logging else logging.INFO
+        for candidate_logger in (self.logger, getattr(self.logger, "logger", None)):
+            try:
+                if candidate_logger and hasattr(candidate_logger, "setLevel"):
+                    candidate_logger.setLevel(log_level)
+                    break
+            except Exception:
+                continue
+
         # Log job start
         self.logger.info(
-            msg=f"Starting network path tracing job for source_host={source_ip}, destination_host={destination_ip}"
+            msg=(
+                f"Starting network path tracing job for source_host={source_ip}, "
+                f"destination_host={destination_ip} (debug_logging={'on' if enable_debug_logging else 'off'})"
+            )
         )
 
         # Log unexpected kwargs (robustness)
