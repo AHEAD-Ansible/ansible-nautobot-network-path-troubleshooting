@@ -7,6 +7,15 @@ from typing import Iterable, Optional
 from .network_graph import NetworkPathGraph
 
 
+NODE_COLORS = {
+    "source": "#60a5fa",       # lighter blue
+    "destination": "#4ade80",  # lighter green
+    "hop": "#9ca3af",          # lighter grey
+    "error": "#f87171",        # lighter red
+    "highlight": "#f59e0b",    # amber for emphasized paths
+}
+
+
 def build_pyvis_network(
     graph: NetworkPathGraph,
     *,
@@ -43,19 +52,19 @@ def build_pyvis_network(
             label = str(label)
         title_lines = [f"{key}: {value}" for key, value in sorted(data.items()) if key != "label"]
         title = "<br/>".join(title_lines) if title_lines else label
-        color = None
+        color = NODE_COLORS["hop"]
         role = data.get("role")
         shape = "dot"
         if role == "layer2":
             shape = "box"
-        if node_id in highlight:
-            color = "#ffd166"
+        if data.get("error"):
+            color = NODE_COLORS["error"]
         elif role == "source":
-            color = "#118ab2"
-        elif role == "start":
-            color = "#06d6a0"
+            color = NODE_COLORS["source"]
         elif role == "destination":
-            color = "#ef476f"
+            color = NODE_COLORS["destination"]
+        elif node_id in highlight:
+            color = NODE_COLORS["highlight"]
         net.add_node(node_key, label=label, title=title, color=color, shape=shape)
 
     edge_occurrences: dict[tuple[str, str], int] = {}

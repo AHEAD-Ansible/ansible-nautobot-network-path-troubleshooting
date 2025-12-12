@@ -454,6 +454,9 @@ def test_path_tracing_blackhole(default_settings, path_gateway, path_validation)
     assert path.reached_destination is False
     assert any("blackhole" in issue for issue in path.issues)
     assert path.hops[0].details == "no route"
+    assert result.graph is not None
+    nodes = {n["id"]: n for n in result.graph.serialize()["nodes"]}
+    assert any(node.get("error") for node in nodes.values())
 
 
 def test_path_tracing_multiple_hops(default_settings, path_gateway, path_validation):

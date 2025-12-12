@@ -286,9 +286,11 @@ class NetworkPathTracerJob(Job):
                     tb = traceback.format_exc()
                     self.logger.warning(msg=f"Visualization generation failed: {exc}\n{tb}")
 
+            reached_destination = any(path.reached_destination for path in path_result.paths)
+
             # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {
-                "status": "success",
+                "status": "success" if reached_destination else "failed",
                 "source": {
                     "input": source_input,
                     "found_in_nautobot": source_found,
@@ -336,8 +338,12 @@ class NetworkPathTracerJob(Job):
 
             # Store result in JobResult (best practice)
             self.job_result.data = result_payload
-            self.job_result.set_status(JobResultStatusChoices.STATUS_SUCCESS)
-            self.logger.success("Network path trace completed successfully.")
+            if reached_destination:
+                self.job_result.set_status(JobResultStatusChoices.STATUS_SUCCESS)
+                self.logger.success("Network path trace completed successfully.")
+            else:
+                self.job_result.set_status(JobResultStatusChoices.STATUS_FAILURE)
+                self.logger.warning("Network path trace completed but destination was unreachable.")
 
             return result_payload
 

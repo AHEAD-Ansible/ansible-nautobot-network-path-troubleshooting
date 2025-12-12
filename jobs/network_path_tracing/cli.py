@@ -210,8 +210,10 @@ def run_steps(
 
     path_result = path_tracing_step.run(validation, gateway)
 
+    reached_destination = any(path.reached_destination for path in path_result.paths)
+
     payload = {
-        "status": "ok",
+        "status": "success" if reached_destination else "failed",
         "source": {
             "input": source_input,
             "found_in_nautobot": validation.source_found,

@@ -194,37 +194,6 @@ class PathTracingStep:
             self._finalize_path(current_hops, path_issues, reached=False)
             return
 
-        if len(current_hops) >= self._max_hops:
-            self._record_issue(
-                path_issues,
-                aggregate_issues,
-                f"Maximum hop count ({self._max_hops}) exceeded.",
-            )
-            self._finalize_path(current_hops, path_issues, reached=False)
-            return
-
-        visited_key = (device_name, interface_name or "")
-        if visited_key in state.visited:
-            self._record_issue(
-                path_issues,
-                aggregate_issues,
-                f"Routing loop detected at device '{device_name}' interface '{interface_name}'.",
-            )
-            self._finalize_path(current_hops, path_issues, reached=False)
-            return
-
-        if state.failed_hops >= self._max_failed_hops:
-            self._record_issue(
-                path_issues,
-                aggregate_issues,
-                f"Too many failed hops ({state.failed_hops}); potential routing issue.",
-            )
-            self._finalize_path(current_hops, path_issues, reached=False)
-            return
-
-        visited = set(state.visited)
-        visited.add(visited_key)
-
         device_nodes = state.device_nodes
         node_id = self._node_id_for_device(
             device_name,
@@ -232,6 +201,31 @@ class PathTracingStep:
             path_index=len(current_hops),
         )
         state.graph_node_id = node_id
+
+        if len(current_hops) >= self._max_hops:
+            message = f"Maximum hop count ({self._max_hops}) exceeded."
+            self._record_issue(path_issues, aggregate_issues, message)
+            self._mark_node_error(graph, node_id, message)
+            self._finalize_path(current_hops, path_issues, reached=False)
+            return
+
+        visited_key = (device_name, interface_name or "")
+        if visited_key in state.visited:
+            message = f"Routing loop detected at device '{device_name}' interface '{interface_name}'."
+            self._record_issue(path_issues, aggregate_issues, message)
+            self._mark_node_error(graph, node_id, message)
+            self._finalize_path(current_hops, path_issues, reached=False)
+            return
+
+        if state.failed_hops >= self._max_failed_hops:
+            message = f"Too many failed hops ({state.failed_hops}); potential routing issue."
+            self._record_issue(path_issues, aggregate_issues, message)
+            self._mark_node_error(graph, node_id, message)
+            self._finalize_path(current_hops, path_issues, reached=False)
+            return
+
+        visited = set(state.visited)
+        visited.add(visited_key)
 
         # Check if current device is the destination
         dest_record = self._data_source.get_ip_address(destination_ip)
@@ -300,7 +294,7 @@ class PathTracingStep:
             current_hops.append(hop)
             self._record_issue(path_issues, aggregate_issues, f"Next-hop lookup failed: {exc}")
             self._finalize_path(current_hops, path_issues, reached=False)
-            graph.ensure_node(node_id, error=str(exc))
+            self._mark_node_error(graph, node_id, str(exc))
             return
 
         if not next_hop_result.found:
@@ -313,8 +307,10 @@ class PathTracingStep:
                 extras={},
             )
             current_hops.append(hop)
-            self._record_issue(path_issues, aggregate_issues, "Routing blackhole detected: no next hop found.")
+            message = "Routing blackhole detected: no next hop found."
+            self._record_issue(path_issues, aggregate_issues, message)
             self._finalize_path(current_hops, path_issues, reached=False)
+            self._mark_node_error(graph, node_id, next_hop_result.details or message)
             graph.ensure_node(node_id, blackhole=True)
             return
 
@@ -490,7 +486,9 @@ class PathTracingStep:
                     display_egress,
                 )
                 layer2_payloads = []
-                self._record_issue(branch_issues, aggregate_issues, "Routing blackhole detected.")
+                message = "Routing blackhole detected."
+                self._record_issue(branch_issues, aggregate_issues, message)
+                self._mark_node_error(graph, graph_source_node_id, message)
                 self._finalize_path(branch_hops, branch_issues, reached=False)
                 continue
 
@@ -627,11 +625,13 @@ class PathTracingStep:
 
             updated_failed_hops = branch_failed_hops + (0 if next_device_name else 1)
             if updated_failed_hops > self._max_failed_hops:
+                message = f"Too many failed hops ({updated_failed_hops}); potential routing issue."
                 self._record_issue(
                     branch_issues,
                     aggregate_issues,
-                    f"Too many failed hops ({updated_failed_hops}); potential routing issue.",
+                    message,
                 )
+                self._mark_node_error(graph, target_node_id, message)
                 self._finalize_path(
                     branch_hops,
                     branch_issues,
@@ -1483,6 +1483,17 @@ class PathTracingStep:
             path_issues.append(message)
         if message not in aggregate:
             aggregate.append(message)
+
+    @staticmethod
+    def _mark_node_error(graph: NetworkPathGraph, node_id: Optional[str], message: str) -> None:
+        """Flag a node with an error reason for visualization purposes."""
+
+        if not node_id:
+            return
+        try:
+            graph.ensure_node(node_id, error=message)
+        except Exception:
+            return
 
     def _finalize_path(
         self, hops: List[PathHop], issues: List[str], reached: bool
