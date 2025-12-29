@@ -53,6 +53,13 @@ This repository ships a Nautobot Job that network operators can run on-demand to
 3. **Verify device primary IPs and platform slugs** – Next-hop discovery connects via the device’s primary IP using the driver implied by the platform slug (e.g., `cisco_ios`, `nxos`, `panos`, `bigip`).  
 4. **Maintain secrets** – The selected `SecretsGroup` **must** provide Generic/username and Generic/password. These credentials are injected into the NAPALM, Palo Alto, and F5 clients automatically.
 
+### Junos/SRX setup
+
+- **Platform mapping** – Ensure the Nautobot Platform for Juniper devices maps `network_driver_mappings["napalm"]` to `junos` (or set `napalm_driver="junos"` on the device). The tracer detects Junos via this mapping first, then by platform slug/name containing `juniper`/`junos`/`srx`.
+- **NETCONF reachability** – NAPALM sessions use NETCONF over SSH on port `830` (`jobs/network_path_tracing/interfaces/juniper/napalm_optional_args`). Enable NETCONF on the SRX and allow the Nautobot worker to reach port 830. Quick checks: `ssh -p 830 <user>@<device_primary_ip>` should return the NETCONF hello; `show system services netconf status` should list SSH.
+- **Credentials** – The Job uses the SecretsGroup Generic username/password for Junos connections. The CLI expects `NAPALM_USERNAME`/`NAPALM_PASSWORD` (or the equivalent flags). These credentials are reused for layer-2 enrichment when enabled.
+- **Layer 2 enrichment** – When layer-2 discovery is on, Junos devices use LLDP/ARP/MAC via NAPALM first and fall back to read-only `show ... | display json` commands when getters are missing.
+
 ---
 
 ## Running the Job in Nautobot
@@ -112,5 +119,6 @@ python jobs/network_path_tracing/cli.py \
 - **NAPALM authentication errors** – Verify the SecretsGroup credentials and that the target device allows SSH/HTTPS login for read-only commands.
 - **Palo Alto or F5 lookups failing** – Check that the device platform slug (or name) includes `palo`, `panos`, `f5`, or `bigip` so the job selects the appropriate client, and that the corresponding environment variables are populated.
 - **Result payload missing** – Create the `network_path_trace_results` JSON custom field on JobResult; otherwise the job logs the payload and continues.
+- **Junos NETCONF failures** – Look for `NAPALM driver 'junos' failed for <device>...` or `NAPALM credentials not configured` in the Job log/CLI output. Confirm the device Platform maps to the `junos` driver, NETCONF is enabled on port 830, and the SecretsGroup/CLI credentials are valid.
 
 For additional implementation details (modules, developer notes, and tests) see `administrators.md` and `TESTING.md`.

@@ -12,4 +12,5 @@ __pycache__/
 /configs
 graph.html
 /job_results_for_validation
+.env
 

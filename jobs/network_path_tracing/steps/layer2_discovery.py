@@ -7,6 +7,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from ..config import NetworkPathSettings
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
+from ..interfaces.juniper import is_junos_device, junos_cli_arp_entry, junos_cli_mac_entry
 
 try:
     import napalm  # noqa: F401  # pragma: no cover - imported to satisfy type checkers
@@ -104,7 +105,7 @@ class Layer2Discovery:
         try:
             for depth in range(max(0, self._settings.layer2_max_depth)):
                 if target_mac is None:
-                    current_arp_entry = self._lookup_arp_entry(current_conn, next_hop_ip)
+                    current_arp_entry = self._lookup_arp_entry(current_conn, next_hop_ip, current_device)
                     if not current_arp_entry:
                         break
                     target_mac = (
@@ -112,7 +113,7 @@ class Layer2Discovery:
                     )
                     if not target_mac:
                         break
-                    mac_entry_on_current = self._lookup_mac_entry(current_conn, target_mac)
+                    mac_entry_on_current = self._lookup_mac_entry(current_conn, target_mac, current_device)
                     if mac_entry_on_current:
                         mac_interface = mac_entry_on_current.get("interface") or mac_entry_on_current.get("port")
                         if mac_interface:
@@ -190,7 +191,7 @@ class Layer2Discovery:
                     opened_connections.append(neighbor_conn)
 
                     try:
-                        neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac)
+                        neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac, neighbor_device)
                         neighbor_neighbors_raw = self._collect_lldp_neighbors(neighbor_conn, neighbor_device.name)
                     except Exception as exc:  # pragma: no cover - defensive logging
                         if self._logger:
@@ -339,7 +340,12 @@ class Layer2Discovery:
             entry.pop("_priority", None)
         return ordered
 
-    def _lookup_arp_entry(self, device_conn, ip_address: str) -> Optional[Dict[str, str]]:
+    def _lookup_arp_entry(
+        self,
+        device_conn,
+        ip_address: str,
+        device: Optional[DeviceRecord],
+    ) -> Optional[Dict[str, str]]:
         """Return ARP entry for ``ip_address`` if present."""
 
         if not device_conn:
@@ -347,6 +353,8 @@ class Layer2Discovery:
         try:
             arp_table = device_conn.get_arp_table()
         except NotImplementedError:
+            if device and is_junos_device(device):
+                return junos_cli_arp_entry(device_conn, ip_address, logger=self._logger)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
             if self._logger:
@@ -365,7 +373,12 @@ class Layer2Discovery:
                 return entry
         return None
 
-    def _lookup_mac_entry(self, device_conn, mac_address: str) -> Optional[Dict[str, str]]:
+    def _lookup_mac_entry(
+        self,
+        device_conn,
+        mac_address: str,
+        device: Optional[DeviceRecord],
+    ) -> Optional[Dict[str, str]]:
         """Return MAC table entry for ``mac_address`` if present."""
 
         if not device_conn:
@@ -373,6 +386,8 @@ class Layer2Discovery:
         try:
             mac_table = device_conn.get_mac_address_table()
         except NotImplementedError:
+            if device and is_junos_device(device):
+                return junos_cli_mac_entry(device_conn, mac_address, logger=self._logger)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
             if self._logger:

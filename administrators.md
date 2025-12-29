@@ -113,4 +113,12 @@ tests/
 - Ensure platform slugs map cleanly to NAPALM drivers; `NextHopDiscoveryStep._is_palo_alto_device()` and `_NXOS_DRIVERS` are good references for how detection is implemented.
 - When running outside Nautobot (CLI or smoke tests), use the provided stubs for Django and NetworkX if you don’t have a full Nautobot environment available—see `tests/gateway_source_l2_smoke.py` for an example.
 
+### Junos/SRX Support
+
+- Detection is centralized in `jobs/network_path_tracing/interfaces/juniper/is_junos_device()`: it prefers `DeviceRecord.napalm_driver == "junos"` (populated by Platform `network_driver_mappings["napalm"]`) and falls back to platform slug/name containing `juniper`, `junos`, or `srx`.
+- NETCONF is used over SSH port `830` (via `napalm_optional_args()`); confirm the worker can reach the device on that port and that NETCONF is enabled. A quick check is `ssh -p 830 <user>@<primary_ip>` (expect a NETCONF hello) or `show system services netconf status` on-box.
+- Credentials come from the selected SecretsGroup (Generic username/password) and are injected into `NetworkPathSettings.napalm`; CLI usage requires `NAPALM_USERNAME`/`NAPALM_PASSWORD` or equivalent flags.
+- Layer-2 fallbacks live in `jobs/network_path_tracing/interfaces/juniper/`: when NAPALM getters raise `NotImplementedError`, `Layer2Discovery` tries `show arp ... | display json`, `show ethernet-switching table mac-address <mac> | display json` / `show bridge mac-table mac-address <mac> | display json`, and `show lldp neighbors detail | display json` via `cli()` to keep MAC/LLDP context populated.
+- Troubleshooting surfaces in job logs (grouping `next-hop-discovery`) and CLI output as `NAPALM driver 'junos' failed for <device>: <error>` or `NAPALM lookup failed...`; timeouts typically mean port 830/NETCONF reachability, while auth errors point to SecretsGroup or CLI credentials.
+
 For details on unit tests, smoke scripts, and how to run them, refer to `TESTING.md`.

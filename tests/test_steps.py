@@ -782,6 +782,415 @@ def _build_next_hop_validation(settings: NetworkPathSettings, gateway: IPAddress
     )
 
 
+def test_selects_junos_driver_from_napalm_driver():
+    """Junos detection should rely on the explicit NAPALM driver field."""
+
+    device = DeviceRecord(
+        name="srx-detect",
+        primary_ip="192.0.2.10",
+        platform_slug="custom",
+        platform_name="Custom SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, NetworkPathSettings())
+
+    assert step._select_napalm_driver(device) == "junos"
+
+
+def test_next_hop_junos_uses_port_830(monkeypatch):
+    """NAPALM Junos connections should use NETCONF port 830."""
+
+    captured: dict[str, object] = {}
+
+    class DummyDriver:
+        def __init__(self, hostname, username, password, optional_args=None):
+            captured["init"] = {
+                "hostname": hostname,
+                "username": username,
+                "password": password,
+                "optional_args": optional_args,
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "203.0.113.10"
+            return {
+                "203.0.113.10/32": [
+                    {"next_hop": "198.51.100.1", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            captured["driver_name"] = name
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-1",
+        primary_ip="192.0.2.10",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert captured["driver_name"] == "junos"
+    assert captured["init"]["optional_args"] == {"port": 830}
+
+
+def test_next_hop_junos_route_normalization(monkeypatch):
+    """Junos route payload should normalize next-hop IP and egress interface."""
+
+    route_table = {
+        "203.0.113.10/32": [
+            {
+                "next_hop": "198.51.100.1",
+                "outgoing_interface": "ge-0/0/0.0",
+                "protocol": "Static",
+            },
+            {
+                "next_hop": "198.51.100.2",
+                "outgoing_interface": "ge-0/0/1.0",
+                "protocol": "Static",
+            },
+        ]
+    }
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "203.0.113.10"
+            return route_table
+
+        def get_lldp_neighbors_detail(self):
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-2",
+        primary_ip="192.0.2.11",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert len(result.next_hops) == 2
+    hop_interfaces = {hop["egress_interface"] for hop in result.next_hops}
+    assert hop_interfaces == {"ge-0/0/0.0", "ge-0/0/1.0"}
+    assert all(hop.get("hop_type") == "layer3" for hop in result.next_hops)
+
+
+def test_next_hop_junos_lldp_classification(monkeypatch):
+    """LLDP evidence on Junos should classify hops as layer2+layer3."""
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "198.51.100.10"
+            return {
+                "198.51.100.10/32": [
+                    {"next_hop": "198.51.100.10", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            return {
+                "ge-0/0/0.0": [
+                    {"remote_system_name": "agg-1", "remote_port": "xe-0/0/1"}
+                ]
+            }
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="198.51.100.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-3",
+        primary_ip="192.0.2.12",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    ip_records = {
+        "198.51.100.10": IPAddressRecord(
+            address="198.51.100.10",
+            prefix_length=31,
+            device_name="agg-1",
+            interface_name="xe-0/0/1",
+        )
+    }
+    data_source = NextHopDataSource(device, ip_records=ip_records)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    hop = result.next_hops[0]
+    assert hop["next_hop_ip"] == "198.51.100.10"
+    assert hop["hop_type"] == "layer2+layer3"
+
+
+def test_next_hop_junos_layer2_fallback(monkeypatch):
+    """Layer-2 discovery should fall back to Junos CLI when getters are missing."""
+
+    mac_address = "aa:bb:cc:00:00:01"
+
+    arp_payload = {
+        "arp-table-information": {
+            "arp-table-entry": [
+                {
+                    "ip-address": "198.51.100.1",
+                    "mac-address": mac_address,
+                    "interface-name": "ge-0/0/0.0",
+                }
+            ]
+        }
+    }
+    mac_payload_edge = {
+        "ethernet-switching-table": {
+            "ethernet-switching-table-entry": [
+                {
+                    "mac-address": mac_address,
+                    "logical-interface": "ge-0/0/0.0",
+                    "vlan": "VLAN100",
+                }
+            ]
+        }
+    }
+    mac_payload_neighbor = {
+        "ethernet-switching-table": {
+            "ethernet-switching-table-entry": [
+                {
+                    "mac-address": mac_address,
+                    "logical-interface": "xe-0/0/1.0",
+                    "vlan": "VLAN100",
+                }
+            ]
+        }
+    }
+
+    class DummyDriver:
+        def __init__(self, hostname, username, password, optional_args=None):
+            self.hostname = hostname
+            self.username = username
+            self.password = password
+            self.optional_args = optional_args
+            self.opened = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def open(self):
+            self.opened = True
+            return self
+
+        def close(self):
+            self.opened = False
+
+        def get_route_to(self, destination):  # noqa: D401
+            if destination != "203.0.113.10":
+                raise AssertionError(f"Unexpected destination {destination}")
+            return {
+                "203.0.113.10/32": [
+                    {"next_hop": "198.51.100.1", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            if self.hostname == "192.0.2.10":
+                return {
+                    "ge-0/0/0.0": [
+                        {"remote_system_name": "Agg-1", "remote_port": "xe-0/0/1"}
+                    ]
+                }
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+        def get_arp_table(self):
+            raise NotImplementedError
+
+        def get_mac_address_table(self):
+            raise NotImplementedError
+
+        def cli(self, commands):
+            command = commands[0]
+            if "show arp" in command:
+                return {command: json.dumps(arp_payload)}
+            if "show ethernet-switching table" in command:
+                if self.hostname == "192.0.2.10":
+                    return {command: json.dumps(mac_payload_edge)}
+                return {command: json.dumps(mac_payload_neighbor)}
+            if "show bridge mac-table" in command:
+                return {command: json.dumps(mac_payload_neighbor)}
+            return {command: "{}"}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        layer2_max_depth=1,
+    )
+
+    device = DeviceRecord(
+        name="srx-l2",
+        primary_ip="192.0.2.10",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    neighbor_device = DeviceRecord(
+        name="Agg-1",
+        primary_ip="192.0.2.11",
+        platform_slug="juniper_junos",
+        platform_name="Juniper QFX",
+        napalm_driver="junos",
+    )
+    ip_records = {
+        "198.51.100.1": IPAddressRecord(
+            address="198.51.100.1",
+            prefix_length=31,
+            device_name="core-1",
+            interface_name="xe-0/0/2",
+        )
+    }
+    devices_map = {
+        neighbor_device.name: neighbor_device,
+    }
+    data_source = NextHopDataSource(device, ip_records=ip_records, devices=devices_map)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    hop = result.next_hops[0]
+    assert hop["hop_type"] == "layer3"
+    assert "layer2_hops" in hop
+    layer2_hops = hop["layer2_hops"]
+    assert len(layer2_hops) == 1
+    l2 = layer2_hops[0]
+    assert l2["device_name"] == neighbor_device.name
+    assert l2["ingress_interface"] == "xe-0/0/1"
+    assert l2["egress_interface"] == "xe-0/0/1.0"
+    assert l2["mac_address"] == mac_address
+    assert l2["gateway_interface"] == "ge-0/0/0.0"
+
+
 def test_next_hop_napalm_parses_route_list(monkeypatch):
     """NAPALM lookup should handle list-based route structures."""
 

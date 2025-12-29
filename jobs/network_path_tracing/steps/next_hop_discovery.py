@@ -11,6 +11,7 @@ import requests
 
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
+from ..interfaces.juniper import is_junos_device, junos_cli_lldp_neighbors, napalm_optional_args
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
 from ..interfaces.palo_alto import PaloAltoClient, _parse_vlan_members
 from ..interfaces.f5_bigip import F5Client, F5APIError
@@ -402,7 +403,9 @@ class NextHopDiscoveryStep:
             return {"port": 443, "verify": False}
         if driver_name == "nxos_ssh":
             return {"port": 22}
-        if driver_name in {"ios", "eos", "junos", "arista_eos", "cisco_ios"}:
+        if driver_name == "junos":
+            return napalm_optional_args()
+        if driver_name in {"ios", "eos", "arista_eos", "cisco_ios"}:
             return {"port": 22}
         return {}
 
@@ -425,6 +428,9 @@ class NextHopDiscoveryStep:
             "arista_eos": "eos",
             "junos": "junos",
         }
+
+        if is_junos_device(device):
+            return "junos"
 
         if device.napalm_driver:
             normalized = device.napalm_driver.lower()
@@ -726,6 +732,11 @@ class NextHopDiscoveryStep:
             basic = self._safe_get_lldp_neighbors(device_conn)
             if basic:
                 neighbors = self._normalize_lldp_basic(basic)
+
+        if not neighbors and device_name:
+            device_record = self._data_source.get_device(device_name)
+            if device_record and is_junos_device(device_record):
+                neighbors = junos_cli_lldp_neighbors(device_conn, logger=self._logger)
 
         if cache_key:
             self._lldp_cache[cache_key] = neighbors
