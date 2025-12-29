@@ -10,6 +10,7 @@ if "napalm" not in sys.modules:
     sys.modules["napalm"] = SimpleNamespace(get_network_driver=lambda *_args, **_kwargs: None)
 
 from jobs.network_path_tracing import NetworkPathSettings
+from jobs.network_path_tracing.interfaces.juniper import junos_cli_lldp_neighbors
 from jobs.network_path_tracing.interfaces.nautobot import DeviceRecord
 from jobs.network_path_tracing.steps.layer2_discovery import Layer2Discovery
 
@@ -87,3 +88,72 @@ def test_junos_cli_mac_fallback():
     assert entry.get("mac") == "aa:bb:cc:00:00:02"
     assert entry.get("interface") == "ge-0/0/1.0"
     assert entry.get("vlan") == "VLAN100"
+
+
+def test_junos_cli_lldp_fallback_parses_json():
+    lldp_payload = {
+        "lldp-neighbors-information": {
+            "lldp-neighbor-information": [
+                {
+                    "lldp-local-port-id": "ge-0/0/0",
+                    "lldp-remote-system-name": "leaf-1",
+                    "lldp-remote-port-id": "et-0/0/1",
+                    "lldp-remote-port-description": "uplink",
+                }
+            ]
+        }
+    }
+
+    class FakeConn:
+        def cli(self, commands):
+            return {commands[0]: json.dumps(lldp_payload)}
+
+    neighbors = junos_cli_lldp_neighbors(FakeConn())
+    assert list(neighbors) == ["ge-0/0/0"]
+    assert neighbors["ge-0/0/0"][0]["hostname"] == "leaf-1"
+    assert neighbors["ge-0/0/0"][0]["port"] == "et-0/0/1"
+    assert neighbors["ge-0/0/0"][0]["port_description"] == "uplink"
+
+
+def test_junos_cli_lldp_fallback_parses_xml_when_json_fails():
+    json_cmd = "show lldp neighbors detail | display json"
+    xml_cmd = "show lldp neighbors detail | display xml"
+    xml_payload = """\
+<rpc-reply>
+  <lldp-neighbors-information>
+    <lldp-neighbor-information>
+      <lldp-local-port-id>ge-0/0/0</lldp-local-port-id>
+      <lldp-remote-system-name>leaf-2</lldp-remote-system-name>
+      <lldp-remote-port-id>et-0/0/2</lldp-remote-port-id>
+      <lldp-remote-port-description>uplink-2</lldp-remote-port-description>
+    </lldp-neighbor-information>
+  </lldp-neighbors-information>
+</rpc-reply>
+"""
+
+    class FakeConn:
+        def cli(self, commands):
+            cmd = commands[0]
+            if cmd == json_cmd:
+                return {cmd: "No LLDP neighbors found."}
+            if cmd == xml_cmd:
+                return {cmd: xml_payload}
+            raise AssertionError(f"Unexpected CLI command: {cmd}")
+
+    neighbors = junos_cli_lldp_neighbors(FakeConn())
+    assert list(neighbors) == ["ge-0/0/0"]
+    assert neighbors["ge-0/0/0"][0]["hostname"] == "leaf-2"
+    assert neighbors["ge-0/0/0"][0]["port"] == "et-0/0/2"
+    assert neighbors["ge-0/0/0"][0]["port_description"] == "uplink-2"
+
+
+def test_layer2_discovery_prioritizes_base_interface_for_subinterfaces():
+    helper = _build_helper()
+    neighbors = {
+        "ae0": [{"hostname": "sw-ae0", "local_interface": "ae0"}],
+        "ge-0/0/0": [{"hostname": "sw-ge0", "local_interface": "ge-0/0/0"}],
+    }
+
+    candidates = helper._candidate_neighbors_for_interface(neighbors, "ge-0/0/0.88")
+    assert candidates
+    assert candidates[0].get("hostname") == "sw-ge0"

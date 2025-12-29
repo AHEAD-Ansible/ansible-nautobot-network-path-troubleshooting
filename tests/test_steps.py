@@ -20,6 +20,7 @@ from jobs.network_path_tracing.interfaces.nautobot import (
     RedundancyMember,
     RedundancyResolution,
 )
+from jobs.network_path_tracing.interfaces.nautobot_api import NautobotAPIDataSource, NautobotAPISettings
 from jobs.network_path_tracing.steps import (
     GatewayDiscoveryResult,
     GatewayDiscoveryStep,
@@ -29,6 +30,7 @@ from jobs.network_path_tracing.steps import (
     NextHopDiscoveryStep,
     PathTracingStep,
 )
+from jobs.network_path_tracing.steps.layer2_discovery import Layer2Discovery
 import jobs.network_path_tracing.steps.next_hop_discovery as next_hop_module
 from jobs.network_path_tracing.interfaces.f5_bigip import F5NextHopSummary
 
@@ -75,6 +77,66 @@ class FakeDataSource:
 
     def resolve_redundant_gateway(self, address: str):  # noqa: D401
         return self._redundancy_resolution
+
+
+def test_nautobot_api_interface_vrf_lookup():
+    """REST API interface lookup should return VRF name even when IP record lacks it."""
+
+    settings = NautobotAPISettings(base_url="http://nautobot.local", token="test-token")
+    ds = NautobotAPIDataSource(settings)
+
+    interface_payload = {
+        "results": [
+            {
+                "name": "Vlan889",
+                "device": {"name": "Cat-1"},
+                "vrf": {
+                    "id": "cb441273-4cad-41a7-b121-327fd8a59a35",
+                    "url": "/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+                },
+                "ip_addresses": [
+                    {
+                        "id": "39231011-a71c-48e2-847d-a802004541cf",
+                        "address": "10.8.99.1/24",
+                    }
+                ],
+            }
+        ]
+    }
+
+    ip_payload = {
+        "id": "39231011-a71c-48e2-847d-a802004541cf",
+        "address": "10.8.99.1/24",
+        "assigned_object": {
+            "name": "Vlan889",
+            "device": {"name": "Cat-1"},
+        },
+    }
+
+    vrf_payload = {"name": "VRF-Test"}
+
+    class DummySession:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, path, params=None):
+            self.calls.append((path, params))
+            if path == "/api/dcim/interfaces/":
+                return interface_payload
+            if path == "/api/ipam/ip-addresses/39231011-a71c-48e2-847d-a802004541cf/":
+                return ip_payload
+            if path in {
+                "/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+                "http://nautobot.local/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+            }:
+                return vrf_payload
+            raise AssertionError(f"Unexpected path {path}")
+
+    ds._session = DummySession()
+
+    record = ds.get_interface_ip("Cat-1", "Vlan889")
+    assert record
+    assert record.vrf == "VRF-Test"
 
 
 @pytest.fixture
@@ -415,7 +477,19 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
         device_name="dest-host",
         interface_name="eth0",
     )
-    data_source = PathDataSource(ip_records={default_settings.destination_ip: dest_record})
+    vrf_record = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="edge-1",
+        interface_name="Gig0/1",
+        vrf="VRF-Test",
+    )
+    data_source = PathDataSource(
+        ip_records={
+            default_settings.destination_ip: dest_record,
+            vrf_record.address: vrf_record,
+        }
+    )
     class StubNextHopStep:
         def run(self, *_args, **_kwargs):  # noqa: D401
             return next_hop_result
@@ -433,6 +507,45 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
     assert path.hops[1].details == "Destination device resolved via Nautobot"
     assert path.hops[0].extras == {"probe": "f5"}
     assert path.hops[1].extras == {}
+    assert path.hops[0].egress_vrf == "VRF-Test"
+    serialized_edges = result.graph.serialize()["edges"]
+    assert any(edge.get("egress_vrf") == "VRF-Test" for edge in serialized_edges)
+
+
+def test_path_tracing_uses_layer2_gateway_for_egress(default_settings, path_gateway, path_validation):
+    """Egress interface should fall back to layer-2 gateway interface when missing."""
+
+    next_hop_ip = "10.30.30.30"
+    next_hop_result = NextHopDiscoveryResult(
+        found=True,
+        next_hops=[{
+            "next_hop_ip": next_hop_ip,
+            "egress_interface": None,
+            "layer2_hops": [
+                {
+                    "device_name": "Switch-Edge",
+                    "ingress_interface": "Eth1/1",
+                    "egress_interface": "Eth1/2",
+                    "gateway_interface": "Gig0/5",
+                    "mac_address": "aa:bb:cc:dd:ee:11",
+                }
+            ],
+        }],
+        details="via l2",
+    )
+
+    data_source = PathDataSource(ip_records={})
+
+    class StubNextHopStep:
+        def run(self, *_args, **_kwargs):  # noqa: D401
+            return next_hop_result
+
+    step = PathTracingStep(data_source, default_settings, StubNextHopStep())
+
+    result = step.run(path_validation, path_gateway)
+
+    hop = result.paths[0].hops[0]
+    assert hop.egress_interface == "Gig0/5"
 
 
 def test_path_tracing_blackhole(default_settings, path_gateway, path_validation):
@@ -766,6 +879,9 @@ class NextHopDataSource:
         return self._ip_records.get(address)
 
     def get_interface_ip(self, device_name: str, interface_name: str):  # noqa: D401,ARG002
+        for record in self._ip_records.values():
+            if record.device_name == device_name and record.interface_name == interface_name:
+                return record
         return None
 
     def resolve_redundant_gateway(self, address: str):  # noqa: D401,ARG002
@@ -1489,6 +1605,180 @@ def test_next_hop_napalm_layer2_chain(monkeypatch):
     assert "layer2_hops" in hop
     assert len(hop["layer2_hops"]) == 1
     assert hop["layer2_hops"][0]["device_name"] == "Switch-1"
+
+
+def test_next_hop_ios_vrf_cli_resolves_egress_interface(monkeypatch):
+    """IOS CLI VRF route parsing should resolve egress interface for static routes."""
+
+    destination_ip = "10.88.0.100"
+    next_hop_ip = "172.8.9.2"
+    vrf = "VRF-Test"
+
+    route_output = f"""Routing Table: {vrf}
+Routing entry for 10.88.0.0/24
+  Known via "static", distance 1, metric 0
+  Routing Descriptor Blocks:
+  * {next_hop_ip}
+      Route metric is 0, traffic share count is 1
+"""
+    next_hop_output = f"""Routing Table: {vrf}
+Routing entry for 172.8.9.0/30
+  Known via "connected", distance 0, metric 0 (connected, via interface)
+  Routing Descriptor Blocks:
+  * directly connected, via GigabitEthernet1/0/3
+      Route metric is 0, traffic share count is 1
+"""
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_lldp_neighbors_detail(self):  # noqa: D401
+            return {}
+
+        def get_lldp_neighbors(self):  # noqa: D401
+            return {}
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == destination_ip
+            return {f"{destination_ip}/32": [{"next_hop": next_hop_ip}]}
+
+        def cli(self, commands):  # noqa: D401
+            command = commands[0]
+            if command == f"show ip route vrf {vrf} {destination_ip}":
+                return {command: route_output}
+            if command == f"show ip route vrf {vrf} {next_hop_ip}":
+                return {command: next_hop_output}
+            return {command: ""}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):  # noqa: D401
+            assert name == "ios"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    device = DeviceRecord(
+        name="Catalyst-2",
+        primary_ip="198.51.100.10",
+        platform_slug="ios",
+        platform_name="iosxe",
+        napalm_driver="ios",
+    )
+
+    vrf_ingress = IPAddressRecord(
+        address="10.8.99.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="Vlan899",
+        vrf=vrf,
+    )
+
+    data_source = NextHopDataSource(device, ip_records={vrf_ingress.address: vrf_ingress})
+    settings = NetworkPathSettings(
+        source_ip="10.8.99.100",
+        destination_ip=destination_ip,
+        napalm=NapalmSettings(username="u", password="p"),
+    )
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.8.99.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="Vlan899",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+    assert result.found is True
+    assert result.next_hops
+    hop = result.next_hops[0]
+    assert hop["next_hop_ip"] == next_hop_ip
+    assert hop["egress_interface"] == "GigabitEthernet1/0/3"
+
+
+def test_layer2_arp_lookup_respects_interface_vrf(monkeypatch):
+    """Layer-2 ARP lookups should consult VRF-specific tables when available."""
+
+    arp_payload = {
+        "TABLE_vrf": {
+            "ROW_vrf": {
+                "vrf-name-out": "VRF-Test",
+                "TABLE_adj": {
+                    "ROW_adj": {
+                        "ip-addr-out": "10.8.99.100",
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "intf-out": "Vlan899",
+                    }
+                },
+            }
+        }
+    }
+
+    class DummyConn:
+        def __init__(self):
+            self.calls: list[tuple[str, object]] = []
+
+        def get_arp_table(self, *args, **kwargs):
+            self.calls.append(("get_arp_table", kwargs))
+            return []
+
+        def cli(self, commands):
+            self.calls.append(("cli", tuple(commands)))
+            return {commands[0]: json.dumps(arp_payload)}
+
+    class DummySource:
+        def get_interface_ip(self, device_name, interface_name):
+            return IPAddressRecord(
+                address="10.8.99.1",
+                prefix_length=24,
+                device_name=device_name,
+                interface_name=interface_name,
+                vrf="VRF-Test",
+            )
+
+        def get_ip_address(self, address):  # noqa: ARG002
+            return None
+
+        def get_device(self, name):  # noqa: ARG002
+            return None
+
+    helper = Layer2Discovery(
+        napalm_module=SimpleNamespace(get_network_driver=lambda *_args, **_kwargs: None),
+        settings=NetworkPathSettings(layer2_max_depth=1),
+        data_source=DummySource(),
+        logger=None,
+        select_driver=lambda device: "ios",
+        driver_attempts=lambda driver: (driver,),
+        optional_args_for=lambda driver: {},
+        collect_lldp_neighbors=lambda conn, name: {},
+        normalize_interface=lambda iface: iface,
+        normalize_hostname=lambda host: host,
+    )
+
+    device = DeviceRecord(
+        name="Cat-1",
+        primary_ip="198.51.100.10",
+        platform_slug="ios",
+        platform_name="iosxe",
+        napalm_driver="ios",
+    )
+
+    conn = DummyConn()
+    entry = helper._lookup_arp_entry(conn, "10.8.99.100", device, "Vlan899")
+
+    assert entry
+    assert entry.get("interface") == "Vlan899"
+    assert entry.get("mac") == "aa:bb:cc:dd:ee:ff"
+    assert any(call[0] == "cli" for call in conn.calls)
+    assert ("get_arp_table", {"vrf": "VRF-Test"}) in conn.calls
 
 
 def test_next_hop_napalm_layer2_disabled(monkeypatch):

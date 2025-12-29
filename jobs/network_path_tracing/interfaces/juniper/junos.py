@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import xml.etree.ElementTree as ElementTree
 from typing import Dict, Iterable, Optional
 
 from ..nautobot import DeviceRecord
@@ -35,8 +36,8 @@ def napalm_optional_args_for_junos(device: DeviceRecord | None = None) -> dict[s
     return napalm_optional_args(device)
 
 
-def _run_cli_json(device_conn, command: str, logger=None) -> Optional[dict]:
-    """Execute a Junos CLI command and return parsed JSON payload if available."""
+def _run_cli(device_conn, command: str, logger=None) -> Optional[object]:
+    """Execute ``command`` via a NAPALM-style ``cli()`` method."""
 
     cli = getattr(device_conn, "cli", None)
     if not callable(cli):
@@ -51,24 +52,94 @@ def _run_cli_json(device_conn, command: str, logger=None) -> Optional[dict]:
             )
         return None
 
-    raw_payload = response.get(command) if isinstance(response, dict) else None
+    if not isinstance(response, dict):
+        return None
+
+    raw_payload = response.get(command)
+    if raw_payload is None and len(response) == 1:
+        raw_payload = next(iter(response.values()))
+    return raw_payload
+
+
+def _ensure_text(value: object) -> Optional[str]:
+    """Return ``value`` decoded into a string, or None."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return None
+
+
+def _run_cli_json(device_conn, command: str, logger=None) -> Optional[dict]:
+    """Execute a Junos CLI command and return parsed JSON payload if available."""
+
+    raw_payload = _run_cli(device_conn, command, logger=logger)
     if raw_payload is None:
         return None
 
     if isinstance(raw_payload, dict):
         return raw_payload
 
-    if isinstance(raw_payload, str):
+    raw_text = _ensure_text(raw_payload)
+    if raw_text is not None:
+        stripped = raw_text.strip()
+        if not stripped:
+            return None
         try:
-            return json.loads(raw_payload)
+            return json.loads(stripped)
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive logging
+            start_candidates = [idx for idx in (raw_text.find("{"), raw_text.find("[")) if idx != -1]
+            if start_candidates:
+                start = min(start_candidates)
+                try:
+                    return json.loads(raw_text[start:].strip())
+                except json.JSONDecodeError:
+                    pass
             if logger:
+                preview = stripped.replace("\n", "\\n")[:200]
                 logger.debug(
-                    f"Failed to decode Junos CLI JSON for '{command}': {exc}",
+                    f"Failed to decode Junos CLI JSON for '{command}': {exc} (output starts with {preview!r})",
                     extra={"grouping": "layer2-discovery"},
                 )
             return None
     return None
+
+
+def _run_cli_xml(device_conn, command: str, logger=None) -> Optional[ElementTree.Element]:
+    """Execute a Junos CLI command and return parsed XML payload when possible."""
+
+    raw_payload = _run_cli(device_conn, command, logger=logger)
+    if raw_payload is None:
+        return None
+
+    if isinstance(raw_payload, ElementTree.Element):
+        return raw_payload
+
+    raw_text = _ensure_text(raw_payload)
+    if raw_text is None:
+        return None
+
+    stripped = raw_text.strip()
+    if not stripped:
+        return None
+
+    start = stripped.find("<")
+    if start > 0:
+        stripped = stripped[start:]
+
+    try:
+        return ElementTree.fromstring(stripped)
+    except ElementTree.ParseError as exc:  # pragma: no cover - defensive logging
+        if logger:
+            preview = stripped.replace("\n", "\\n")[:200]
+            logger.debug(
+                f"Failed to decode Junos CLI XML for '{command}': {exc} (output starts with {preview!r})",
+                extra={"grouping": "layer2-discovery"},
+            )
+        return None
 
 
 def _first_value(entry: dict, *keys: str) -> Optional[str]:
@@ -198,7 +269,43 @@ def junos_cli_lldp_neighbors(device_conn, *, logger=None) -> Dict[str, list[Dict
 
     payload = _run_cli_json(device_conn, "show lldp neighbors detail | display json", logger=logger)
     if not payload:
-        return {}
+        xml_root = _run_cli_xml(device_conn, "show lldp neighbors detail | display xml", logger=logger)
+        if xml_root is None:
+            return {}
+
+        def _localname(tag: str) -> str:
+            if "}" in tag:
+                return tag.split("}", 1)[1]
+            return tag
+
+        def _xml_text(node: ElementTree.Element, *names: str) -> Optional[str]:
+            target = set(names)
+            for child in node.iter():
+                if _localname(child.tag) in target and child.text:
+                    token = child.text.strip()
+                    if token:
+                        return token
+            return None
+
+        neighbors: Dict[str, list[Dict[str, Optional[str]]]] = {}
+        for entry in xml_root.iter():
+            if _localname(entry.tag) != "lldp-neighbor-information":
+                continue
+            local_if = _xml_text(entry, "lldp-local-port-id", "lldp-local-interface")
+            if not local_if:
+                continue
+            remote_name = _xml_text(entry, "lldp-remote-system-name", "lldp-remote-chassis-id")
+            remote_port = _xml_text(entry, "lldp-remote-port-id", "lldp-remote-port-description")
+            remote_port_desc = _xml_text(entry, "lldp-remote-port-description")
+            neighbors.setdefault(local_if, []).append(
+                {
+                    "hostname": remote_name,
+                    "port": remote_port,
+                    "port_description": remote_port_desc,
+                    "local_interface": local_if,
+                }
+            )
+        return neighbors
 
     lldp_info = payload.get("lldp-neighbors-information") or {}
     entries = lldp_info.get("lldp-neighbor-information") or []

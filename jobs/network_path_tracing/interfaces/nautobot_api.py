@@ -143,6 +143,7 @@ class NautobotAPIDataSource(NautobotDataSource):
             return None
 
         interface = results[0]
+        interface_vrf = self._vrf_name_from_ref(interface.get("vrf"))
         ip_assignments = interface.get("ip_addresses") or []
         if not ip_assignments:
             return None
@@ -158,6 +159,7 @@ class NautobotAPIDataSource(NautobotDataSource):
                 prefix_length=self._extract_prefix_length(address) or 32,
                 device_name=device_name,
                 interface_name=interface_name,
+                vrf=interface_vrf or self._extract_vrf_name(ip_entry),
             )
 
         try:
@@ -165,7 +167,10 @@ class NautobotAPIDataSource(NautobotDataSource):
         except requests.RequestException:
             return None
 
-        return self._build_ip_record(record)
+        ip_record = self._build_ip_record(record)
+        if interface_vrf and not ip_record.vrf:
+            ip_record.vrf = interface_vrf
+        return ip_record
 
 
     def resolve_redundant_gateway(self, address: str) -> Optional[RedundancyResolution]:
@@ -485,11 +490,13 @@ class NautobotAPIDataSource(NautobotDataSource):
         if not address_str:
             address_str = self._strip_prefix(record.get("address"))
         device_name, interface_name = self._resolve_assignment_details(record)
+        vrf = self._extract_vrf_name(record)
         return IPAddressRecord(
             address=address_str,
             prefix_length=int(prefix_length),
             device_name=device_name,
             interface_name=interface_name,
+            vrf=vrf,
         )
 
     @staticmethod
@@ -508,6 +515,54 @@ class NautobotAPIDataSource(NautobotDataSource):
         if not isinstance(value, str):
             return ""
         return value.split("/")[0]
+
+    def _extract_vrf_name(self, record: dict) -> Optional[str]:
+        """Return the VRF name from an IP record if present."""
+        vrf_obj = record.get("vrf") or record.get("routing_instance")
+        return self._vrf_name_from_ref(vrf_obj)
+
+    def _vrf_name_from_ref(self, vrf_obj: object) -> Optional[str]:
+        """Resolve a VRF name from a reference object, fetching details if needed."""
+        if vrf_obj is None:
+            return None
+        if isinstance(vrf_obj, str):
+            value = vrf_obj.strip()
+            return value or None
+        if not isinstance(vrf_obj, dict):
+            return None
+        direct = self._extract_vrf_fields(vrf_obj)
+        if direct:
+            return direct
+        url = vrf_obj.get("url")
+        if isinstance(url, str) and url:
+            name = self._fetch_vrf_name_by_path(url)
+            if name:
+                return name
+        vrf_id = vrf_obj.get("id")
+        if vrf_id:
+            return self._fetch_vrf_name_by_path(f"/api/ipam/vrfs/{vrf_id}/")
+        return None
+
+    @staticmethod
+    def _extract_vrf_fields(payload: dict) -> Optional[str]:
+        """Extract VRF name-like fields from a payload without additional fetches."""
+        for key in ("name", "display", "rd", "value", "slug"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        return None
+
+    def _fetch_vrf_name_by_path(self, path: str) -> Optional[str]:
+        """Fetch VRF detail by URL or API path and return a usable name."""
+        if not path:
+            return None
+        try:
+            payload = self._session.get_json(path, params={"depth": 1})
+        except requests.RequestException:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return self._extract_vrf_fields(payload)
 
     def _resolve_assignment_details(self, record: dict) -> tuple[Optional[str], Optional[str]]:
         """Resolve device and interface names from IP record."""
