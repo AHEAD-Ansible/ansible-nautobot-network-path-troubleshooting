@@ -1,4 +1,5 @@
 /venv
+.venv/
 /REFERENCE
 /network_path_tracing/__pycache__/
 .pytest_cache
@@ -12,4 +13,5 @@ __pycache__/
 /configs
 graph.html
 /job_results_for_validation
+.env
 

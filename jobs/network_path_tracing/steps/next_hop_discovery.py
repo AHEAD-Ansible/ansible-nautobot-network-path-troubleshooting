@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -11,6 +12,7 @@ import requests
 
 from ..config import NetworkPathSettings
 from ..exceptions import NextHopDiscoveryError
+from ..interfaces.juniper import is_junos_device, junos_cli_lldp_neighbors, napalm_optional_args
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
 from ..interfaces.palo_alto import PaloAltoClient, _parse_vlan_members
 from ..interfaces.f5_bigip import F5Client, F5APIError
@@ -325,8 +327,32 @@ class NextHopDiscoveryStep:
                         next_hops = self._collect_nxos_routes(device_conn, destination_ip, ingress_if)
                         details = f"Resolved via NX-OS CLI on '{device.name}'"
                     else:
-                        next_hops = self._collect_generic_routes(device_conn, destination_ip)
-                        details = f"Resolved via NAPALM on '{device.name}'"
+                        ingress_vrf: Optional[str] = None
+                        try:
+                            ingress_record = self._data_source.get_interface_ip(device.name, ingress_if)
+                            if ingress_record and ingress_record.vrf:
+                                ingress_vrf = ingress_record.vrf
+                        except Exception:
+                            ingress_vrf = None
+
+                        ingress_vrf = self._normalize_vrf_name(ingress_vrf)
+
+                        next_hops = []
+                        if ingress_vrf and candidate in {"ios", "cisco_ios"}:
+                            next_hops = self._collect_ios_vrf_routes(device_conn, destination_ip, ingress_vrf)
+                            if next_hops:
+                                details = f"Resolved via IOS VRF CLI on '{device.name}'"
+                            else:
+                                details = f"Resolved via NAPALM on '{device.name}'"
+                        else:
+                            details = f"Resolved via NAPALM on '{device.name}'"
+
+                        if not next_hops:
+                            next_hops = self._collect_generic_routes(
+                                device_conn,
+                                destination_ip,
+                                vrf=ingress_vrf,
+                            )
 
                     self._annotate_hops_with_lldp(
                         next_hops=next_hops,
@@ -402,7 +428,9 @@ class NextHopDiscoveryStep:
             return {"port": 443, "verify": False}
         if driver_name == "nxos_ssh":
             return {"port": 22}
-        if driver_name in {"ios", "eos", "junos", "arista_eos", "cisco_ios"}:
+        if driver_name == "junos":
+            return napalm_optional_args()
+        if driver_name in {"ios", "eos", "arista_eos", "cisco_ios"}:
             return {"port": 22}
         return {}
 
@@ -426,6 +454,9 @@ class NextHopDiscoveryStep:
             "junos": "junos",
         }
 
+        if is_junos_device(device):
+            return "junos"
+
         if device.napalm_driver:
             normalized = device.napalm_driver.lower()
             return driver_map.get(normalized, device.napalm_driver)
@@ -439,18 +470,32 @@ class NextHopDiscoveryStep:
         return "ios"
 
     @staticmethod
-    def _collect_generic_routes(device_conn, destination_ip: str) -> List[dict]:
+    def _collect_generic_routes(
+        device_conn,
+        destination_ip: str,
+        *,
+        vrf: Optional[str] = None,
+    ) -> List[dict]:
         """Collect next-hop information using NAPALM's get_route_to().
 
         Args:
             device_conn: NAPALM device connection.
             destination_ip: Destination IP to look up.
+            vrf: Optional VRF to scope the lookup.
 
         Returns:
             List of dictionaries with next-hop and egress interface details.
         """
         try:
-            route_table = device_conn.get_route_to(destination=destination_ip)
+            if vrf:
+                try:
+                    route_table = device_conn.get_route_to(destination=destination_ip, vrf=vrf)
+                except TypeError:
+                    route_table = device_conn.get_route_to(destination=destination_ip)
+                if not route_table:
+                    route_table = device_conn.get_route_to(destination=destination_ip)
+            else:
+                route_table = device_conn.get_route_to(destination=destination_ip)
         except Exception as exc:
             raise NextHopDiscoveryError(f"get_route_to failed: {exc}") from exc
 
@@ -476,8 +521,107 @@ class NextHopDiscoveryStep:
                             "next_hop_ip": next_hop_ip,
                             "egress_interface": egress_if,
                         }
-                    )
+                )
         return next_hops
+
+    @staticmethod
+    def _normalize_vrf_name(vrf: Optional[str]) -> Optional[str]:
+        if vrf is None:
+            return None
+        value = str(vrf).strip()
+        if not value:
+            return None
+        if value.lower() in {"default", "global"}:
+            return None
+        return value
+
+    def _collect_ios_vrf_routes(self, device_conn, destination_ip: str, vrf: str) -> List[dict]:
+        """Collect next-hop information for IOS platforms via VRF-aware CLI parsing."""
+
+        if not vrf:
+            return []
+        if not hasattr(device_conn, "cli"):
+            return []
+
+        output = self._run_cli_command(device_conn, f"show ip route vrf {vrf} {destination_ip}")
+        if not output:
+            return []
+
+        hops = self._parse_ios_show_ip_route(output)
+        if not hops:
+            return []
+
+        for hop in hops:
+            next_hop_ip = hop.get("next_hop_ip")
+            if not next_hop_ip:
+                continue
+            if hop.get("egress_interface"):
+                continue
+            resolved = self._resolve_ios_next_hop_interface(device_conn, vrf, next_hop_ip)
+            if resolved:
+                hop["egress_interface"] = resolved
+
+        return [hop for hop in hops if hop.get("next_hop_ip") or hop.get("egress_interface")]
+
+    def _resolve_ios_next_hop_interface(self, device_conn, vrf: str, next_hop_ip: str) -> Optional[str]:
+        """Return the directly connected egress interface toward ``next_hop_ip`` within ``vrf``."""
+
+        output = self._run_cli_command(device_conn, f"show ip route vrf {vrf} {next_hop_ip}")
+        if not output:
+            return None
+        hops = self._parse_ios_show_ip_route(output)
+        for hop in hops:
+            iface = hop.get("egress_interface")
+            if iface:
+                return iface
+        return None
+
+    def _run_cli_command(self, device_conn, command: str) -> Optional[str]:
+        """Run a CLI command through NAPALM and return its output."""
+
+        try:
+            response = device_conn.cli([command])
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if self._logger:
+                self._logger.info(
+                    "NAPALM CLI lookup failed for '%s': %s",
+                    command,
+                    exc,
+                    extra={"grouping": "next-hop-discovery"},
+                )
+            return None
+        if not isinstance(response, dict):
+            return None
+        output = response.get(command)
+        if not isinstance(output, str):
+            return None
+        return output
+
+    def _parse_ios_show_ip_route(self, output: str) -> List[dict]:
+        """Parse `show ip route ...` output into next-hop and interface tuples."""
+
+        via_pattern = re.compile(r"\bvia\s+(?P<iface>\S+)")
+        ip_pattern = re.compile(r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})")
+
+        hops: List[dict] = []
+        for raw_line in str(output).splitlines():
+            line = raw_line.strip()
+            if not line.startswith("*"):
+                continue
+            content = line.lstrip("*").strip()
+            iface_match = via_pattern.search(content)
+            iface = iface_match.group("iface") if iface_match else None
+
+            next_hop_ip = None
+            if "directly connected" not in content.lower():
+                ip_match = ip_pattern.search(content)
+                if ip_match:
+                    next_hop_ip = ip_match.group("ip")
+
+            hops.append({"next_hop_ip": next_hop_ip, "egress_interface": iface})
+
+        return hops
+
 
     def _collect_nxos_routes(self, device_conn, destination_ip: str, ingress_if: str) -> List[dict]:
         """Collect next-hop information for NX-OS platforms via CLI JSON.
@@ -718,14 +862,22 @@ class NextHopDiscoveryStep:
             return self._lldp_cache[cache_key]
 
         neighbors: Dict[str, List[Dict[str, Optional[str]]]] = {}
+        napalm_supported = False
 
         detail = self._safe_get_lldp_neighbors_detail(device_conn)
-        if detail:
+        if detail is not None:
+            napalm_supported = True
             neighbors = self._normalize_lldp_detail(detail)
         else:
             basic = self._safe_get_lldp_neighbors(device_conn)
-            if basic:
+            if basic is not None:
+                napalm_supported = True
                 neighbors = self._normalize_lldp_basic(basic)
+
+        if not neighbors and device_name and not napalm_supported:
+            device_record = self._data_source.get_device(device_name)
+            if device_record and is_junos_device(device_record):
+                neighbors = junos_cli_lldp_neighbors(device_conn, logger=self._logger)
 
         if cache_key:
             self._lldp_cache[cache_key] = neighbors

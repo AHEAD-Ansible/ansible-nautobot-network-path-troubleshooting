@@ -13,6 +13,7 @@ class IPAddressRecord:
     prefix_length: int
     device_name: Optional[str] = None
     interface_name: Optional[str] = None
+    vrf: Optional[str] = None
 
 
 @dataclass

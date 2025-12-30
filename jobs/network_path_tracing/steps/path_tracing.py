@@ -31,6 +31,8 @@ class PathHop:
     next_hop_ip: Optional[str]
     egress_interface: Optional[str]
     details: Optional[str]
+    ingress_vrf: Optional[str] = None
+    egress_vrf: Optional[str] = None
     extras: Dict[str, Any] = field(default_factory=dict)
     hop_type: Optional[str] = None
 
@@ -233,8 +235,10 @@ class PathTracingStep:
             hop_entry = PathHop(
                 device_name=device_name,
                 interface_name=interface_name,
+                ingress_vrf=self._lookup_interface_vrf(device_name, interface_name),
                 next_hop_ip=destination_ip,
                 egress_interface=dest_record.interface_name,
+                egress_vrf=self._lookup_interface_vrf(device_name, dest_record.interface_name),
                 details="Reached destination on current device (local route).",
                 extras={},
             )
@@ -286,6 +290,7 @@ class PathTracingStep:
             hop = PathHop(
                 device_name=device_name,
                 interface_name=interface_name,
+                ingress_vrf=self._lookup_interface_vrf(device_name, interface_name),
                 next_hop_ip=None,
                 egress_interface=None,
                 details=str(exc),
@@ -301,6 +306,7 @@ class PathTracingStep:
             hop = PathHop(
                 device_name=device_name,
                 interface_name=interface_name,
+                ingress_vrf=self._lookup_interface_vrf(device_name, interface_name),
                 next_hop_ip=None,
                 egress_interface=None,
                 details=next_hop_result.details,
@@ -327,16 +333,34 @@ class PathTracingStep:
             extras = self._extract_hop_extras(next_hop)
             display_interface = extras.get("ingress_interface") or interface_name
             display_egress = extras.get("egress_interface") or egress_interface
+            ingress_vrf = self._lookup_interface_vrf(device_name, display_interface)
+            egress_vrf = self._lookup_interface_vrf(device_name, display_egress)
 
             layer2_payloads = list(next_hop.get("layer2_hops") or [])
+            if not display_egress and layer2_payloads:
+                for payload in layer2_payloads:
+                    candidate = (
+                        payload.get("gateway_interface")
+                        or payload.get("egress_interface")
+                        or payload.get("ingress_interface")
+                    )
+                    if candidate:
+                        display_egress = candidate
+                        egress_vrf = egress_vrf or self._lookup_interface_vrf(device_name, display_egress)
+                        break
 
             if next_hop_ip in (None, "", "local", "0.0.0.0"):
                 if dest_record and dest_record.device_name == device_name:
+                    if display_egress is None and dest_record.interface_name:
+                        display_egress = dest_record.interface_name
+                        egress_vrf = self._lookup_interface_vrf(device_name, display_egress)
                     hop_entry = PathHop(
                         device_name=device_name,
                         interface_name=display_interface,
+                        ingress_vrf=ingress_vrf,
                         next_hop_ip=destination_ip,
                         egress_interface=display_egress,
+                        egress_vrf=egress_vrf,
                         details="Local route to destination.",
                         extras=extras,
                         hop_type=self._as_layer3_hop_type(hop_type),
@@ -382,6 +406,7 @@ class PathTracingStep:
                         local_route=True,
                         details=hop_entry.details,
                         egress_interface=edge_egress,
+                        egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                         dashed=layer2_added_total,
                     )
                     if layer2_added_total:
@@ -391,6 +416,7 @@ class PathTracingStep:
                             hop=hop_entry,
                             next_hop_ip=destination_ip,
                             egress_interface=edge_egress,
+                            egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                             details=hop_entry.details,
                             local_route=True,
                         )
@@ -402,8 +428,10 @@ class PathTracingStep:
                     hop_entry = PathHop(
                         device_name=device_name,
                         interface_name=display_interface,
+                        ingress_vrf=ingress_vrf,
                         next_hop_ip=destination_ip,
                         egress_interface=display_egress,
+                        egress_vrf=egress_vrf,
                         details=f"Destination within subnet of interface '{egress_interface}'.",
                         extras=extras,
                         hop_type=self._as_layer3_hop_type(hop_type),
@@ -450,6 +478,7 @@ class PathTracingStep:
                         hop=destination_hop or hop_entry,
                         next_hop_ip=destination_ip,
                         egress_interface=edge_egress,
+                        egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                         details=hop_entry.details,
                         dashed=layer2_added_total,
                     )
@@ -460,6 +489,7 @@ class PathTracingStep:
                             hop=hop_entry,
                             next_hop_ip=destination_ip,
                             egress_interface=edge_egress,
+                            egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                             details=hop_entry.details,
                         )
                     if destination_hop:
@@ -470,8 +500,10 @@ class PathTracingStep:
                 hop = PathHop(
                     device_name=device_name,
                     interface_name=display_interface,
+                    ingress_vrf=ingress_vrf,
                     next_hop_ip=None,
                     egress_interface=display_egress,
+                    egress_vrf=egress_vrf,
                     details="No next hop; possible blackhole.",
                     extras=extras,
                     hop_type=self._as_layer3_hop_type(hop_type),
@@ -494,18 +526,23 @@ class PathTracingStep:
 
             next_hop_record = self._data_source.get_ip_address(next_hop_ip) if next_hop_ip else None
 
+            next_device_name = next_hop_record.device_name if next_hop_record else None
+            next_interface = next_hop_record.interface_name if next_hop_record else egress_interface
+
+            if not egress_vrf and display_egress:
+                egress_vrf = self._lookup_interface_vrf(device_name, display_egress)
+
             hop_entry = PathHop(
                 device_name=device_name,
                 interface_name=display_interface,
+                ingress_vrf=ingress_vrf,
                 next_hop_ip=next_hop_ip,
                 egress_interface=display_egress,
+                egress_vrf=egress_vrf,
                 details=next_hop_result.details,
                 extras=extras,
                 hop_type=self._as_layer3_hop_type(hop_type),
             )
-
-            next_device_name = next_hop_record.device_name if next_hop_record else None
-            next_interface = next_hop_record.interface_name if next_hop_record else egress_interface
 
             is_destination = False
             if next_hop_ip == destination_ip:
@@ -553,6 +590,7 @@ class PathTracingStep:
                     hop=destination_hop or hop_entry,
                     next_hop_ip=next_hop_ip,
                     egress_interface=edge_egress,
+                    egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                     details=next_hop_result.details,
                     dashed=layer2_added_total,
                 )
@@ -563,6 +601,7 @@ class PathTracingStep:
                         hop=hop_entry,
                         next_hop_ip=next_hop_ip,
                         egress_interface=edge_egress,
+                        egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                         details=next_hop_result.details,
                     )
                 if destination_hop:
@@ -610,6 +649,7 @@ class PathTracingStep:
                 hop=hop_entry,
                 next_hop_ip=next_hop_ip,
                 egress_interface=display_egress,
+                egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                 details=next_hop_result.details,
                 dashed=l2_added,
             )
@@ -620,6 +660,7 @@ class PathTracingStep:
                     hop=hop_entry,
                     next_hop_ip=next_hop_ip,
                     egress_interface=display_egress,
+                    egress_vrf=self._vrf_or_global(egress_vrf) if display_egress else None,
                     details=next_hop_result.details,
                 )
 
@@ -673,6 +714,7 @@ class PathTracingStep:
             "ip_address": record.address,
             "role": "source",
         }
+        source_vrf = self._lookup_interface_vrf(record.device_name, record.interface_name)
         if record.interface_name:
             node_attrs["interfaces"] = [record.interface_name]
         graph.ensure_node(node_id, **node_attrs)
@@ -685,6 +727,7 @@ class PathTracingStep:
                 source_interface=record.interface_name,
                 target_interface=start_interface,
                 egress_interface=record.interface_name,
+                egress_vrf=self._vrf_or_global(source_vrf) if record.interface_name else None,
             )
 
         return node_id
@@ -807,6 +850,44 @@ class PathTracingStep:
 
         if value and value not in container:
             container.append(value)
+
+    def _lookup_interface_vrf(self, device_name: Optional[str], interface_name: Optional[str]) -> Optional[str]:
+        """Return VRF for the given device/interface using Nautobot data."""
+
+        if not device_name or not interface_name:
+            return None
+
+        candidates = [interface_name]
+        normalize = getattr(self._next_hop_step, "_normalize_interface", None)
+        if callable(normalize):
+            normalized = normalize(interface_name)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        for candidate in candidates:
+            try:
+                record = self._data_source.get_interface_ip(device_name, candidate)
+            except Exception:
+                continue
+            if record and record.vrf:
+                return record.vrf
+        return None
+
+    @staticmethod
+    def _vrf_or_global(vrf: Optional[str]) -> str:
+        """Normalize VRF to a display value."""
+
+        if vrf is None or str(vrf).strip() == "":
+            return "global"
+        return str(vrf)
+
+    def _label_with_vrf(self, interface: Optional[str], vrf: Optional[str]) -> Optional[str]:
+        """Return interface label suffixed with VRF in parentheses."""
+
+        if not interface:
+            return None
+        display_vrf = self._vrf_or_global(vrf)
+        return f"{interface} ({display_vrf})"
 
     @staticmethod
     def _format_interface_label(name: Optional[str]) -> Optional[str]:
@@ -1119,13 +1200,17 @@ class PathTracingStep:
             extras = {}
             if payload.get("mac_address"):
                 extras["mac_address"] = payload.get("mac_address")
+            ingress_vrf = self._lookup_interface_vrf(device_name, ingress_interface)
+            egress_vrf = self._lookup_interface_vrf(device_name, egress_interface)
 
             normalized.append(
                 PathHop(
                     device_name=device_name,
                     interface_name=ingress_interface,
+                    ingress_vrf=ingress_vrf,
                     next_hop_ip=None,
                     egress_interface=egress_interface,
+                    egress_vrf=egress_vrf,
                     details=details,
                     extras=extras,
                     hop_type="layer2",
@@ -1157,6 +1242,8 @@ class PathTracingStep:
 
         egress_interface = dest_gateway.gateway.interface_name
         ingress_interface = state.interface_name
+        ingress_vrf = self._lookup_interface_vrf(device_name, ingress_interface)
+        egress_vrf = self._lookup_interface_vrf(device_name, egress_interface)
         details = (
             f"Destination within subnet of interface '{egress_interface}'."
             if egress_interface
@@ -1165,8 +1252,10 @@ class PathTracingStep:
         hop_entry = PathHop(
             device_name=device_name,
             interface_name=ingress_interface,
+            ingress_vrf=ingress_vrf,
             next_hop_ip=destination_ip,
             egress_interface=egress_interface,
+            egress_vrf=egress_vrf,
             details=details,
             extras={},
             hop_type="layer3",
@@ -1279,6 +1368,7 @@ class PathTracingStep:
             hop=destination_hop or hop_entry,
             next_hop_ip=destination_ip,
             egress_interface=dotted_label,
+            egress_vrf=self._vrf_or_global(egress_vrf) if dotted_label else None,
             details=hop_entry.details,
             dashed=l2_added,
         )
@@ -1289,6 +1379,7 @@ class PathTracingStep:
                 hop=hop_entry,
                 next_hop_ip=destination_ip,
                 egress_interface=solid_label,
+                egress_vrf=self._vrf_or_global(egress_vrf) if solid_label else None,
                 details=hop_entry.details,
             )
         if destination_hop:
@@ -1373,11 +1464,15 @@ class PathTracingStep:
                 "ingress_interface": payload.get("ingress_interface"),
                 "egress_interface": payload.get("egress_interface"),
             }
+            ingress_vrf = self._lookup_interface_vrf(payload.get("device_name"), payload.get("ingress_interface"))
+            egress_vrf = self._lookup_interface_vrf(payload.get("device_name"), payload.get("egress_interface"))
             layer2_hop = PathHop(
                 device_name=payload.get("device_name"),
                 interface_name=payload.get("ingress_interface"),
+                ingress_vrf=ingress_vrf,
                 next_hop_ip=None,
                 egress_interface=payload.get("egress_interface"),
+                egress_vrf=egress_vrf,
                 details=details,
                 extras=extras,
                 hop_type="layer2",
@@ -1659,11 +1754,14 @@ class PathTracingStep:
         dest_record = self._data_source.get_ip_address(destination_ip)
         if dest_record:
             details = "Destination device resolved via Nautobot"
+            dest_vrf = self._lookup_interface_vrf(dest_record.device_name, dest_record.interface_name)
             return PathHop(
                 device_name=dest_record.device_name,
                 interface_name=dest_record.interface_name,
+                ingress_vrf=dest_vrf,
                 next_hop_ip=destination_ip,
                 egress_interface=None,
+                egress_vrf=None,
                 details=details,
                 extras={},
             )
@@ -1671,8 +1769,10 @@ class PathTracingStep:
         return PathHop(
             device_name="device_info: Not Found",
             interface_name=None,
+            ingress_vrf=None,
             next_hop_ip=destination_ip,
             egress_interface=None,
+            egress_vrf=None,
             details="Destination device info not found in Nautobot",
             extras={},
         )

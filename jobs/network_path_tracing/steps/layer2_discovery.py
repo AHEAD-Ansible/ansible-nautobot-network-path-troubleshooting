@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from ..config import NetworkPathSettings
 from ..interfaces.nautobot import DeviceRecord, NautobotDataSource
+from ..interfaces.juniper import is_junos_device, junos_cli_arp_entry, junos_cli_mac_entry
 
 try:
     import napalm  # noqa: F401  # pragma: no cover - imported to satisfy type checkers
@@ -104,7 +106,12 @@ class Layer2Discovery:
         try:
             for depth in range(max(0, self._settings.layer2_max_depth)):
                 if target_mac is None:
-                    current_arp_entry = self._lookup_arp_entry(current_conn, next_hop_ip)
+                    current_arp_entry = self._lookup_arp_entry(
+                        current_conn,
+                        next_hop_ip,
+                        current_device,
+                        current_interface,
+                    )
                     if not current_arp_entry:
                         break
                     target_mac = (
@@ -112,7 +119,7 @@ class Layer2Discovery:
                     )
                     if not target_mac:
                         break
-                    mac_entry_on_current = self._lookup_mac_entry(current_conn, target_mac)
+                    mac_entry_on_current = self._lookup_mac_entry(current_conn, target_mac, current_device)
                     if mac_entry_on_current:
                         mac_interface = mac_entry_on_current.get("interface") or mac_entry_on_current.get("port")
                         if mac_interface:
@@ -190,7 +197,7 @@ class Layer2Discovery:
                     opened_connections.append(neighbor_conn)
 
                     try:
-                        neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac)
+                        neighbor_mac_entry = self._lookup_mac_entry(neighbor_conn, target_mac, neighbor_device)
                         neighbor_neighbors_raw = self._collect_lldp_neighbors(neighbor_conn, neighbor_device.name)
                     except Exception as exc:  # pragma: no cover - defensive logging
                         if self._logger:
@@ -313,6 +320,11 @@ class Layer2Discovery:
         ordered: List[Dict[str, Optional[str]]] = []
         seen: set[int] = set()
         normalized_target = self._normalize_interface(interface)
+        normalized_target_base: Optional[str] = None
+        if normalized_target and "." in normalized_target:
+            candidate = normalized_target.split(".", 1)[0]
+            if candidate and candidate != normalized_target:
+                normalized_target_base = candidate
 
         def _push(entry: Dict[str, Optional[str]], priority: int) -> None:
             key = id(entry)
@@ -322,9 +334,10 @@ class Layer2Discovery:
             entry.setdefault("_priority", priority)
             ordered.append(entry)
 
-        if normalized_target and normalized_target in neighbors:
-            for entry in neighbors.get(normalized_target, []):
-                _push(entry, 0)
+        for target in (normalized_target, normalized_target_base):
+            if target and target in neighbors:
+                for entry in neighbors.get(target, []):
+                    _push(entry, 0)
 
         for local_if, entries in neighbors.items():
             normalized_local = self._normalize_interface(local_if)
@@ -339,33 +352,211 @@ class Layer2Discovery:
             entry.pop("_priority", None)
         return ordered
 
-    def _lookup_arp_entry(self, device_conn, ip_address: str) -> Optional[Dict[str, str]]:
+    def _lookup_arp_entry(
+        self,
+        device_conn,
+        ip_address: str,
+        device: Optional[DeviceRecord],
+        interface: Optional[str] = None,
+    ) -> Optional[Dict[str, str]]:
         """Return ARP entry for ``ip_address`` if present."""
 
         if not device_conn:
             return None
-        try:
-            arp_table = device_conn.get_arp_table()
-        except NotImplementedError:
+
+        vrf_hint = self._interface_vrf(device, interface)
+        if vrf_hint and self._logger:
+            self._logger.debug(
+                "Attempting ARP lookup for %s in VRF '%s' on %s",
+                ip_address,
+                vrf_hint,
+                device.name if device else "unknown",
+                extra={"grouping": "layer2-discovery"},
+            )
+
+        entry = self._lookup_arp_table(device_conn, ip_address, device, vrf_hint)
+        if entry:
+            return entry
+
+        if vrf_hint:
+            entry = self._lookup_cisco_cli_arp(device_conn, ip_address, vrf_hint)
+            if entry:
+                return entry
+
+        return None
+
+    def _lookup_arp_table(
+        self,
+        device_conn,
+        ip_address: str,
+        device: Optional[DeviceRecord],
+        vrf_hint: Optional[str],
+    ) -> Optional[Dict[str, str]]:
+        """Search ARP table (optionally scoped to VRF) for ``ip_address``."""
+
+        vrf_candidates: List[Optional[str]] = []
+        normalized_vrf = self._normalize_vrf(vrf_hint)
+        if normalized_vrf:
+            vrf_candidates.append(normalized_vrf)
+        vrf_candidates.append(None)
+
+        for vrf in vrf_candidates:
+            try:
+                if vrf:
+                    arp_table = device_conn.get_arp_table(vrf=vrf)
+                else:
+                    arp_table = device_conn.get_arp_table()
+            except TypeError:
+                if vrf:
+                    continue
+                if device and is_junos_device(device):
+                    return junos_cli_arp_entry(device_conn, ip_address, logger=self._logger)
+                continue
+            except NotImplementedError:
+                if vrf:
+                    continue
+                if device and is_junos_device(device):
+                    return junos_cli_arp_entry(device_conn, ip_address, logger=self._logger)
+                return None
+            except Exception as exc:  # pragma: no cover - defensive logging
+                if self._logger:
+                    self._logger.debug(
+                        f"ARP lookup failed on device connection: {exc}",
+                        extra={"grouping": "layer2-discovery"},
+                    )
+                continue
+
+            entry = self._find_in_arp_table(arp_table, ip_address)
+            if entry:
+                return entry
+
+        return None
+
+    def _lookup_cisco_cli_arp(self, device_conn, ip_address: str, vrf: Optional[str]) -> Optional[Dict[str, str]]:
+        """Attempt VRF-scoped ARP lookup using Cisco-style CLI JSON."""
+
+        vrf_value = self._normalize_vrf(vrf)
+        if not vrf_value or not hasattr(device_conn, "cli"):
             return None
+
+        command = f"show ip arp vrf {vrf_value} {ip_address} | json"
+        try:
+            response = device_conn.cli([command])
         except Exception as exc:  # pragma: no cover - defensive logging
             if self._logger:
                 self._logger.debug(
-                    f"ARP lookup failed on device connection: {exc}",
+                    f"VRF-specific ARP CLI failed for '{command}': {exc}",
                     extra={"grouping": "layer2-discovery"},
                 )
             return None
+
+        payload = response.get(command) if isinstance(response, dict) else None
+        if payload is None:
+            return None
+
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if self._logger:
+                self._logger.debug(
+                    f"VRF-specific ARP CLI JSON decode failed for '{command}': {exc}",
+                    extra={"grouping": "layer2-discovery"},
+                )
+            return None
+
+        return self._parse_cisco_arp_payload(data, ip_address)
+
+    @staticmethod
+    def _find_in_arp_table(arp_table, ip_address: str) -> Optional[Dict[str, str]]:
+        """Return ARP entry from ``arp_table`` if present."""
 
         if not isinstance(arp_table, Iterable):
             return None
         for entry in arp_table:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("ip") == ip_address:
+            ip_value = entry.get("ip") or entry.get("ip_address") or entry.get("address")
+            if ip_value == ip_address:
                 return entry
         return None
 
-    def _lookup_mac_entry(self, device_conn, mac_address: str) -> Optional[Dict[str, str]]:
+    def _interface_vrf(self, device: Optional[DeviceRecord], interface: Optional[str]) -> Optional[str]:
+        """Return VRF name for ``device``/``interface`` via Nautobot data."""
+
+        if not device or not interface:
+            return None
+
+        interface_candidates = [interface]
+        if self._normalize_interface:
+            normalized = self._normalize_interface(interface)
+            if normalized and normalized not in interface_candidates:
+                interface_candidates.append(normalized)
+
+        for candidate in interface_candidates:
+            try:
+                record = self._data_source.get_interface_ip(device.name, candidate)
+            except Exception:
+                continue
+            if record and record.vrf:
+                return record.vrf
+        return None
+
+    def _parse_cisco_arp_payload(self, payload: object, ip_address: str) -> Optional[Dict[str, str]]:
+        """Parse Cisco-style JSON ARP payloads and return the entry for ``ip_address``."""
+
+        if not isinstance(payload, dict):
+            return None
+
+        vrf_table = payload.get("TABLE_vrf") or {}
+        vrf_nodes = self._as_list(vrf_table.get("ROW_vrf"))
+        if not vrf_nodes:
+            vrf_nodes = [payload]
+
+        for vrf_node in vrf_nodes:
+            if not isinstance(vrf_node, dict):
+                continue
+            adj_table = vrf_node.get("TABLE_adj") or vrf_node.get("TABLE_arp") or {}
+            for entry in self._as_list(adj_table.get("ROW_adj") or adj_table.get("ROW_arp")):
+                if not isinstance(entry, dict):
+                    continue
+                ip_value = entry.get("ip-addr-out") or entry.get("ip") or entry.get("address")
+                if ip_value != ip_address:
+                    continue
+                return {
+                    "ip": ip_value,
+                    "mac": entry.get("mac") or entry.get("hwaddr") or entry.get("mac-addr") or entry.get("mac_address"),
+                    "interface": entry.get("intf-out") or entry.get("interface") or entry.get("outgoing-interface"),
+                }
+
+        return None
+
+    @staticmethod
+    def _normalize_vrf(vrf: Optional[str]) -> Optional[str]:
+        """Normalize VRF names to meaningful values."""
+
+        if vrf is None:
+            return None
+        vrf_value = str(vrf).strip()
+        if not vrf_value or vrf_value.lower() in {"default", "global"}:
+            return None
+        return vrf_value
+
+    @staticmethod
+    def _as_list(value) -> List:
+        """Normalize a value into a list."""
+
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _lookup_mac_entry(
+        self,
+        device_conn,
+        mac_address: str,
+        device: Optional[DeviceRecord],
+    ) -> Optional[Dict[str, str]]:
         """Return MAC table entry for ``mac_address`` if present."""
 
         if not device_conn:
@@ -373,6 +564,8 @@ class Layer2Discovery:
         try:
             mac_table = device_conn.get_mac_address_table()
         except NotImplementedError:
+            if device and is_junos_device(device):
+                return junos_cli_mac_entry(device_conn, mac_address, logger=self._logger)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
             if self._logger:

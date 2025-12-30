@@ -20,6 +20,7 @@ from jobs.network_path_tracing.interfaces.nautobot import (
     RedundancyMember,
     RedundancyResolution,
 )
+from jobs.network_path_tracing.interfaces.nautobot_api import NautobotAPIDataSource, NautobotAPISettings
 from jobs.network_path_tracing.steps import (
     GatewayDiscoveryResult,
     GatewayDiscoveryStep,
@@ -29,6 +30,7 @@ from jobs.network_path_tracing.steps import (
     NextHopDiscoveryStep,
     PathTracingStep,
 )
+from jobs.network_path_tracing.steps.layer2_discovery import Layer2Discovery
 import jobs.network_path_tracing.steps.next_hop_discovery as next_hop_module
 from jobs.network_path_tracing.interfaces.f5_bigip import F5NextHopSummary
 
@@ -75,6 +77,66 @@ class FakeDataSource:
 
     def resolve_redundant_gateway(self, address: str):  # noqa: D401
         return self._redundancy_resolution
+
+
+def test_nautobot_api_interface_vrf_lookup():
+    """REST API interface lookup should return VRF name even when IP record lacks it."""
+
+    settings = NautobotAPISettings(base_url="http://nautobot.local", token="test-token")
+    ds = NautobotAPIDataSource(settings)
+
+    interface_payload = {
+        "results": [
+            {
+                "name": "Vlan889",
+                "device": {"name": "Cat-1"},
+                "vrf": {
+                    "id": "cb441273-4cad-41a7-b121-327fd8a59a35",
+                    "url": "/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+                },
+                "ip_addresses": [
+                    {
+                        "id": "39231011-a71c-48e2-847d-a802004541cf",
+                        "address": "10.8.99.1/24",
+                    }
+                ],
+            }
+        ]
+    }
+
+    ip_payload = {
+        "id": "39231011-a71c-48e2-847d-a802004541cf",
+        "address": "10.8.99.1/24",
+        "assigned_object": {
+            "name": "Vlan889",
+            "device": {"name": "Cat-1"},
+        },
+    }
+
+    vrf_payload = {"name": "VRF-Test"}
+
+    class DummySession:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, path, params=None):
+            self.calls.append((path, params))
+            if path == "/api/dcim/interfaces/":
+                return interface_payload
+            if path == "/api/ipam/ip-addresses/39231011-a71c-48e2-847d-a802004541cf/":
+                return ip_payload
+            if path in {
+                "/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+                "http://nautobot.local/api/ipam/vrfs/cb441273-4cad-41a7-b121-327fd8a59a35/",
+            }:
+                return vrf_payload
+            raise AssertionError(f"Unexpected path {path}")
+
+    ds._session = DummySession()
+
+    record = ds.get_interface_ip("Cat-1", "Vlan889")
+    assert record
+    assert record.vrf == "VRF-Test"
 
 
 @pytest.fixture
@@ -415,7 +477,19 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
         device_name="dest-host",
         interface_name="eth0",
     )
-    data_source = PathDataSource(ip_records={default_settings.destination_ip: dest_record})
+    vrf_record = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name="edge-1",
+        interface_name="Gig0/1",
+        vrf="VRF-Test",
+    )
+    data_source = PathDataSource(
+        ip_records={
+            default_settings.destination_ip: dest_record,
+            vrf_record.address: vrf_record,
+        }
+    )
     class StubNextHopStep:
         def run(self, *_args, **_kwargs):  # noqa: D401
             return next_hop_result
@@ -433,6 +507,45 @@ def test_path_tracing_reaches_destination(default_settings, path_gateway, path_v
     assert path.hops[1].details == "Destination device resolved via Nautobot"
     assert path.hops[0].extras == {"probe": "f5"}
     assert path.hops[1].extras == {}
+    assert path.hops[0].egress_vrf == "VRF-Test"
+    serialized_edges = result.graph.serialize()["edges"]
+    assert any(edge.get("egress_vrf") == "VRF-Test" for edge in serialized_edges)
+
+
+def test_path_tracing_uses_layer2_gateway_for_egress(default_settings, path_gateway, path_validation):
+    """Egress interface should fall back to layer-2 gateway interface when missing."""
+
+    next_hop_ip = "10.30.30.30"
+    next_hop_result = NextHopDiscoveryResult(
+        found=True,
+        next_hops=[{
+            "next_hop_ip": next_hop_ip,
+            "egress_interface": None,
+            "layer2_hops": [
+                {
+                    "device_name": "Switch-Edge",
+                    "ingress_interface": "Eth1/1",
+                    "egress_interface": "Eth1/2",
+                    "gateway_interface": "Gig0/5",
+                    "mac_address": "aa:bb:cc:dd:ee:11",
+                }
+            ],
+        }],
+        details="via l2",
+    )
+
+    data_source = PathDataSource(ip_records={})
+
+    class StubNextHopStep:
+        def run(self, *_args, **_kwargs):  # noqa: D401
+            return next_hop_result
+
+    step = PathTracingStep(data_source, default_settings, StubNextHopStep())
+
+    result = step.run(path_validation, path_gateway)
+
+    hop = result.paths[0].hops[0]
+    assert hop.egress_interface == "Gig0/5"
 
 
 def test_path_tracing_blackhole(default_settings, path_gateway, path_validation):
@@ -766,6 +879,9 @@ class NextHopDataSource:
         return self._ip_records.get(address)
 
     def get_interface_ip(self, device_name: str, interface_name: str):  # noqa: D401,ARG002
+        for record in self._ip_records.values():
+            if record.device_name == device_name and record.interface_name == interface_name:
+                return record
         return None
 
     def resolve_redundant_gateway(self, address: str):  # noqa: D401,ARG002
@@ -780,6 +896,415 @@ def _build_next_hop_validation(settings: NetworkPathSettings, gateway: IPAddress
         source_prefix=PrefixRecord(prefix="10.10.10.0/24", status="active", id="pfx"),
         is_host_ip=False,
     )
+
+
+def test_selects_junos_driver_from_napalm_driver():
+    """Junos detection should rely on the explicit NAPALM driver field."""
+
+    device = DeviceRecord(
+        name="srx-detect",
+        primary_ip="192.0.2.10",
+        platform_slug="custom",
+        platform_name="Custom SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, NetworkPathSettings())
+
+    assert step._select_napalm_driver(device) == "junos"
+
+
+def test_next_hop_junos_uses_port_830(monkeypatch):
+    """NAPALM Junos connections should use NETCONF port 830."""
+
+    captured: dict[str, object] = {}
+
+    class DummyDriver:
+        def __init__(self, hostname, username, password, optional_args=None):
+            captured["init"] = {
+                "hostname": hostname,
+                "username": username,
+                "password": password,
+                "optional_args": optional_args,
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "203.0.113.10"
+            return {
+                "203.0.113.10/32": [
+                    {"next_hop": "198.51.100.1", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            captured["driver_name"] = name
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-1",
+        primary_ip="192.0.2.10",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert captured["driver_name"] == "junos"
+    assert captured["init"]["optional_args"] == {"port": 830}
+
+
+def test_next_hop_junos_route_normalization(monkeypatch):
+    """Junos route payload should normalize next-hop IP and egress interface."""
+
+    route_table = {
+        "203.0.113.10/32": [
+            {
+                "next_hop": "198.51.100.1",
+                "outgoing_interface": "ge-0/0/0.0",
+                "protocol": "Static",
+            },
+            {
+                "next_hop": "198.51.100.2",
+                "outgoing_interface": "ge-0/0/1.0",
+                "protocol": "Static",
+            },
+        ]
+    }
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "203.0.113.10"
+            return route_table
+
+        def get_lldp_neighbors_detail(self):
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-2",
+        primary_ip="192.0.2.11",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    data_source = NextHopDataSource(device)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    assert len(result.next_hops) == 2
+    hop_interfaces = {hop["egress_interface"] for hop in result.next_hops}
+    assert hop_interfaces == {"ge-0/0/0.0", "ge-0/0/1.0"}
+    assert all(hop.get("hop_type") == "layer3" for hop in result.next_hops)
+
+
+def test_next_hop_junos_lldp_classification(monkeypatch):
+    """LLDP evidence on Junos should classify hops as layer2+layer3."""
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == "198.51.100.10"
+            return {
+                "198.51.100.10/32": [
+                    {"next_hop": "198.51.100.10", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            return {
+                "ge-0/0/0.0": [
+                    {"remote_system_name": "agg-1", "remote_port": "xe-0/0/1"}
+                ]
+            }
+
+        def get_lldp_neighbors(self):
+            return {}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="198.51.100.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        enable_layer2_discovery=False,
+    )
+    device = DeviceRecord(
+        name="srx-3",
+        primary_ip="192.0.2.12",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    ip_records = {
+        "198.51.100.10": IPAddressRecord(
+            address="198.51.100.10",
+            prefix_length=31,
+            device_name="agg-1",
+            interface_name="xe-0/0/1",
+        )
+    }
+    data_source = NextHopDataSource(device, ip_records=ip_records)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    hop = result.next_hops[0]
+    assert hop["next_hop_ip"] == "198.51.100.10"
+    assert hop["hop_type"] == "layer2+layer3"
+
+
+def test_next_hop_junos_layer2_fallback(monkeypatch):
+    """Layer-2 discovery should fall back to Junos CLI when getters are missing."""
+
+    mac_address = "aa:bb:cc:00:00:01"
+
+    arp_payload = {
+        "arp-table-information": {
+            "arp-table-entry": [
+                {
+                    "ip-address": "198.51.100.1",
+                    "mac-address": mac_address,
+                    "interface-name": "ge-0/0/0.0",
+                }
+            ]
+        }
+    }
+    mac_payload_edge = {
+        "ethernet-switching-table": {
+            "ethernet-switching-table-entry": [
+                {
+                    "mac-address": mac_address,
+                    "logical-interface": "ge-0/0/0.0",
+                    "vlan": "VLAN100",
+                }
+            ]
+        }
+    }
+    mac_payload_neighbor = {
+        "ethernet-switching-table": {
+            "ethernet-switching-table-entry": [
+                {
+                    "mac-address": mac_address,
+                    "logical-interface": "xe-0/0/1.0",
+                    "vlan": "VLAN100",
+                }
+            ]
+        }
+    }
+
+    class DummyDriver:
+        def __init__(self, hostname, username, password, optional_args=None):
+            self.hostname = hostname
+            self.username = username
+            self.password = password
+            self.optional_args = optional_args
+            self.opened = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def open(self):
+            self.opened = True
+            return self
+
+        def close(self):
+            self.opened = False
+
+        def get_route_to(self, destination):  # noqa: D401
+            if destination != "203.0.113.10":
+                raise AssertionError(f"Unexpected destination {destination}")
+            return {
+                "203.0.113.10/32": [
+                    {"next_hop": "198.51.100.1", "outgoing_interface": "ge-0/0/0.0"}
+                ]
+            }
+
+        def get_lldp_neighbors_detail(self):
+            if self.hostname == "192.0.2.10":
+                return {
+                    "ge-0/0/0.0": [
+                        {"remote_system_name": "Agg-1", "remote_port": "xe-0/0/1"}
+                    ]
+                }
+            return {}
+
+        def get_lldp_neighbors(self):
+            return {}
+
+        def get_arp_table(self):
+            raise NotImplementedError
+
+        def get_mac_address_table(self):
+            raise NotImplementedError
+
+        def cli(self, commands):
+            command = commands[0]
+            if "show arp" in command:
+                return {command: json.dumps(arp_payload)}
+            if "show ethernet-switching table" in command:
+                if self.hostname == "192.0.2.10":
+                    return {command: json.dumps(mac_payload_edge)}
+                return {command: json.dumps(mac_payload_neighbor)}
+            if "show bridge mac-table" in command:
+                return {command: json.dumps(mac_payload_neighbor)}
+            return {command: "{}"}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):
+            assert name == "junos"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    settings = NetworkPathSettings(
+        source_ip="10.0.0.1",
+        destination_ip="203.0.113.10",
+        napalm=NapalmSettings(username="netops", password="secret"),
+        layer2_max_depth=1,
+    )
+
+    device = DeviceRecord(
+        name="srx-l2",
+        primary_ip="192.0.2.10",
+        platform_slug="juniper_junos",
+        platform_name="Juniper SRX",
+        napalm_driver="junos",
+    )
+    neighbor_device = DeviceRecord(
+        name="Agg-1",
+        primary_ip="192.0.2.11",
+        platform_slug="juniper_junos",
+        platform_name="Juniper QFX",
+        napalm_driver="junos",
+    )
+    ip_records = {
+        "198.51.100.1": IPAddressRecord(
+            address="198.51.100.1",
+            prefix_length=31,
+            device_name="core-1",
+            interface_name="xe-0/0/2",
+        )
+    }
+    devices_map = {
+        neighbor_device.name: neighbor_device,
+    }
+    data_source = NextHopDataSource(device, ip_records=ip_records, devices=devices_map)
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.10.10.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="ge-0/0/0.0",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+
+    assert result.found is True
+    hop = result.next_hops[0]
+    assert hop["hop_type"] == "layer3"
+    assert "layer2_hops" in hop
+    layer2_hops = hop["layer2_hops"]
+    assert len(layer2_hops) == 1
+    l2 = layer2_hops[0]
+    assert l2["device_name"] == neighbor_device.name
+    assert l2["ingress_interface"] == "xe-0/0/1"
+    assert l2["egress_interface"] == "xe-0/0/1.0"
+    assert l2["mac_address"] == mac_address
+    assert l2["gateway_interface"] == "ge-0/0/0.0"
 
 
 def test_next_hop_napalm_parses_route_list(monkeypatch):
@@ -1080,6 +1605,180 @@ def test_next_hop_napalm_layer2_chain(monkeypatch):
     assert "layer2_hops" in hop
     assert len(hop["layer2_hops"]) == 1
     assert hop["layer2_hops"][0]["device_name"] == "Switch-1"
+
+
+def test_next_hop_ios_vrf_cli_resolves_egress_interface(monkeypatch):
+    """IOS CLI VRF route parsing should resolve egress interface for static routes."""
+
+    destination_ip = "10.88.0.100"
+    next_hop_ip = "172.8.9.2"
+    vrf = "VRF-Test"
+
+    route_output = f"""Routing Table: {vrf}
+Routing entry for 10.88.0.0/24
+  Known via "static", distance 1, metric 0
+  Routing Descriptor Blocks:
+  * {next_hop_ip}
+      Route metric is 0, traffic share count is 1
+"""
+    next_hop_output = f"""Routing Table: {vrf}
+Routing entry for 172.8.9.0/30
+  Known via "connected", distance 0, metric 0 (connected, via interface)
+  Routing Descriptor Blocks:
+  * directly connected, via GigabitEthernet1/0/3
+      Route metric is 0, traffic share count is 1
+"""
+
+    class DummyDriver:
+        def __init__(self, *_, **__):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get_lldp_neighbors_detail(self):  # noqa: D401
+            return {}
+
+        def get_lldp_neighbors(self):  # noqa: D401
+            return {}
+
+        def get_route_to(self, destination):  # noqa: D401
+            assert destination == destination_ip
+            return {f"{destination_ip}/32": [{"next_hop": next_hop_ip}]}
+
+        def cli(self, commands):  # noqa: D401
+            command = commands[0]
+            if command == f"show ip route vrf {vrf} {destination_ip}":
+                return {command: route_output}
+            if command == f"show ip route vrf {vrf} {next_hop_ip}":
+                return {command: next_hop_output}
+            return {command: ""}
+
+    class DummyNapalm:
+        @staticmethod
+        def get_network_driver(name):  # noqa: D401
+            assert name == "ios"
+            return DummyDriver
+
+    monkeypatch.setattr(next_hop_module, "napalm", DummyNapalm())
+
+    device = DeviceRecord(
+        name="Catalyst-2",
+        primary_ip="198.51.100.10",
+        platform_slug="ios",
+        platform_name="iosxe",
+        napalm_driver="ios",
+    )
+
+    vrf_ingress = IPAddressRecord(
+        address="10.8.99.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="Vlan899",
+        vrf=vrf,
+    )
+
+    data_source = NextHopDataSource(device, ip_records={vrf_ingress.address: vrf_ingress})
+    settings = NetworkPathSettings(
+        source_ip="10.8.99.100",
+        destination_ip=destination_ip,
+        napalm=NapalmSettings(username="u", password="p"),
+    )
+    step = NextHopDiscoveryStep(data_source, settings)
+    gateway = IPAddressRecord(
+        address="10.8.99.1",
+        prefix_length=24,
+        device_name=device.name,
+        interface_name="Vlan899",
+    )
+    validation = _build_next_hop_validation(settings, gateway)
+
+    result = step.run(validation, GatewayDiscoveryResult(found=True, method="manual", gateway=gateway))
+    assert result.found is True
+    assert result.next_hops
+    hop = result.next_hops[0]
+    assert hop["next_hop_ip"] == next_hop_ip
+    assert hop["egress_interface"] == "GigabitEthernet1/0/3"
+
+
+def test_layer2_arp_lookup_respects_interface_vrf(monkeypatch):
+    """Layer-2 ARP lookups should consult VRF-specific tables when available."""
+
+    arp_payload = {
+        "TABLE_vrf": {
+            "ROW_vrf": {
+                "vrf-name-out": "VRF-Test",
+                "TABLE_adj": {
+                    "ROW_adj": {
+                        "ip-addr-out": "10.8.99.100",
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "intf-out": "Vlan899",
+                    }
+                },
+            }
+        }
+    }
+
+    class DummyConn:
+        def __init__(self):
+            self.calls: list[tuple[str, object]] = []
+
+        def get_arp_table(self, *args, **kwargs):
+            self.calls.append(("get_arp_table", kwargs))
+            return []
+
+        def cli(self, commands):
+            self.calls.append(("cli", tuple(commands)))
+            return {commands[0]: json.dumps(arp_payload)}
+
+    class DummySource:
+        def get_interface_ip(self, device_name, interface_name):
+            return IPAddressRecord(
+                address="10.8.99.1",
+                prefix_length=24,
+                device_name=device_name,
+                interface_name=interface_name,
+                vrf="VRF-Test",
+            )
+
+        def get_ip_address(self, address):  # noqa: ARG002
+            return None
+
+        def get_device(self, name):  # noqa: ARG002
+            return None
+
+    helper = Layer2Discovery(
+        napalm_module=SimpleNamespace(get_network_driver=lambda *_args, **_kwargs: None),
+        settings=NetworkPathSettings(layer2_max_depth=1),
+        data_source=DummySource(),
+        logger=None,
+        select_driver=lambda device: "ios",
+        driver_attempts=lambda driver: (driver,),
+        optional_args_for=lambda driver: {},
+        collect_lldp_neighbors=lambda conn, name: {},
+        normalize_interface=lambda iface: iface,
+        normalize_hostname=lambda host: host,
+    )
+
+    device = DeviceRecord(
+        name="Cat-1",
+        primary_ip="198.51.100.10",
+        platform_slug="ios",
+        platform_name="iosxe",
+        napalm_driver="ios",
+    )
+
+    conn = DummyConn()
+    entry = helper._lookup_arp_entry(conn, "10.8.99.100", device, "Vlan899")
+
+    assert entry
+    assert entry.get("interface") == "Vlan899"
+    assert entry.get("mac") == "aa:bb:cc:dd:ee:ff"
+    assert any(call[0] == "cli" for call in conn.calls)
+    assert ("get_arp_table", {"vrf": "VRF-Test"}) in conn.calls
 
 
 def test_next_hop_napalm_layer2_disabled(monkeypatch):

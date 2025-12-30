@@ -41,6 +41,11 @@ def _hop_to_payload(hop: PathHop) -> Dict[str, Any]:
         "next_hop_ip": hop.next_hop_ip,
         "details": hop.details,
     }
+    include_vrf = hop.hop_type != "layer2"
+    if include_vrf and hop.interface_name:
+        payload["ingress_vrf"] = PathTracingStep._vrf_or_global(hop.ingress_vrf)
+    if include_vrf and hop.egress_interface:
+        payload["egress_vrf"] = PathTracingStep._vrf_or_global(hop.egress_vrf)
     for key, value in (hop.extras or {}).items():
         if value is None:
             continue

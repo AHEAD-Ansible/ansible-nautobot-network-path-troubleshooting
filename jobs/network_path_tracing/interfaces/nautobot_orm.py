@@ -295,9 +295,22 @@ class NautobotORMDataSource(NautobotDataSource):
             interface_name = getattr(interface, "name", None) or getattr(interface, "display", None)
             if getattr(interface, "device", None):
                 device_name = getattr(interface.device, "name", None)
+        vrf_name = None
+        vrf = getattr(ip_obj, "vrf", None)
+        if vrf:
+            vrf_name = getattr(vrf, "name", None) or getattr(vrf, "rd", None) or getattr(vrf, "display", None)
+        elif interface:
+            iface_vrf = getattr(interface, "vrf", None)
+            if iface_vrf:
+                vrf_name = (
+                    getattr(iface_vrf, "name", None)
+                    or getattr(iface_vrf, "rd", None)
+                    or getattr(iface_vrf, "display", None)
+                )
         return IPAddressRecord(
             address=address,
             prefix_length=prefix_length,
             device_name=device_name,
             interface_name=interface_name,
+            vrf=str(vrf_name) if vrf_name else None,
         )

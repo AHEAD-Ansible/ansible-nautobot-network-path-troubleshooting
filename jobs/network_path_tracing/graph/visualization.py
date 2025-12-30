@@ -69,6 +69,12 @@ def build_pyvis_network(
 
     edge_occurrences: dict[tuple[str, str], int] = {}
 
+    def _format_label(interface: Optional[str], vrf: Optional[str]) -> Optional[str]:
+        if not interface:
+            return None
+        display_vrf = "global" if vrf in (None, "", "None") else str(vrf)
+        return f"{interface} ({display_vrf})"
+
     for source, target, key, data in graph.graph.edges(keys=True, data=True):
         title_lines = [
             f"{attr}: {value}"
@@ -77,7 +83,10 @@ def build_pyvis_network(
         ]
         hop = data.get("hop")
         if hop is not None:
-            hop_title = [f"{field}: {getattr(hop, field)}" for field in ("next_hop_ip", "egress_interface", "details")]
+            hop_title = [
+                f"{field}: {getattr(hop, field)}"
+                for field in ("next_hop_ip", "egress_interface", "egress_vrf", "details")
+            ]
             title_lines.extend(hop_title)
         title = "<br/>".join(title_lines) if title_lines else None
         idx = edge_occurrences.get((source, target), 0)
@@ -90,7 +99,13 @@ def build_pyvis_network(
         source_key = id_map.get(source, str(source))
         target_key = id_map.get(target, str(target))
         edge_id = f"{source_key}->{target_key}::{key}_{idx}"
-        label = data.get("egress_interface") or data.get("next_hop_ip")
+        label = None
+        if hop is not None:
+            label = _format_label(getattr(hop, "egress_interface", None), getattr(hop, "egress_vrf", None))
+        if label is None:
+            label = _format_label(data.get("egress_interface"), data.get("egress_vrf"))
+        if label is None:
+            label = data.get("next_hop_ip")
         dashes = bool(data.get("dashed"))
         net.add_edge(
             source_key,
