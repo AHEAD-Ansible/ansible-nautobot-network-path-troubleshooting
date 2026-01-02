@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from getpass import getpass
 from pathlib import Path
@@ -21,6 +22,7 @@ from .graph import build_pyvis_network
 from .interfaces.nautobot_api import NautobotAPIDataSource
 from .interfaces.nautobot_orm import NautobotORMDataSource
 from .steps import (
+    FirewallLogCheckStep,
     GatewayDiscoveryStep,
     InputValidationStep,
     NextHopDiscoveryStep,
@@ -98,6 +100,44 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Destination IP address or hostname (default: {_DEFAULT_DESTINATION_IP})",
     )
     parser.add_argument(
+        "--check-panorama-logs",
+        action="store_true",
+        help=(
+            "Enable Panorama traffic log check for DENY entries matching src/dst/--log-port "
+            "(last 24h, default max 10 results; see --panorama-log-* options to tune)."
+        ),
+    )
+    parser.add_argument(
+        "--panorama-host",
+        help="Panorama hostname/IP for log check (or set PANORAMA_HOST). Required with --check-panorama-logs.",
+    )
+    parser.add_argument(
+        "--log-port",
+        type=int,
+        help="Destination port to match in Panorama traffic logs (0-65535). Required with --check-panorama-logs.",
+    )
+    parser.add_argument(
+        "--panorama-log-max-wait-seconds",
+        type=int,
+        help=(
+            "Optional: max seconds to wait for Panorama async traffic-log queries "
+            "(default: PANORAMA_LOG_QUERY_MAX_WAIT_SECONDS or 30)."
+        ),
+    )
+    parser.add_argument(
+        "--panorama-log-fetch-limit",
+        type=int,
+        help=(
+            "Optional: number of matching traffic log rows to fetch before filtering for DENY "
+            "(default: PANORAMA_LOG_QUERY_FETCH_LIMIT or 10)."
+        ),
+    )
+    parser.add_argument(
+        "--panorama-log-max-results",
+        type=int,
+        help="Optional: maximum number of DENY log entries to return (default: 10).",
+    )
+    parser.add_argument(
         "--visualize-html",
         help=(
             "Optional output path for a PyVis HTML file representing the traced graph. "
@@ -140,6 +180,12 @@ def run_steps(
     debug: bool = False,
     source_ip: Optional[str] = None,
     destination_ip: Optional[str] = None,
+    check_panorama_logs: bool = False,
+    panorama_host: Optional[str] = None,
+    log_port: Optional[int] = None,
+    panorama_log_max_wait_seconds: Optional[int] = None,
+    panorama_log_fetch_limit: Optional[int] = None,
+    panorama_log_max_results: Optional[int] = None,
     visualize_html: Optional[str] = None,
     napalm_username: Optional[str] = None,
     napalm_password: Optional[str] = None,
@@ -184,6 +230,27 @@ def run_steps(
         f5=base_settings.f5,
     )
 
+    resolved_panorama_host: Optional[str] = None
+    firewall_logs = FirewallLogCheckStep.disabled_payload()
+    if check_panorama_logs:
+        resolved_panorama_host = (panorama_host or os.getenv("PANORAMA_HOST", "")).strip()
+        if not resolved_panorama_host:
+            raise InputValidationError(
+                "Panorama log check enabled but no host provided (use --panorama-host or set PANORAMA_HOST)."
+            )
+        if log_port is None:
+            raise InputValidationError(
+                "Panorama log check enabled but --log-port was not provided."
+            )
+        if log_port < 0 or log_port > 65535:
+            raise InputValidationError("--log-port must be an integer in range 0-65535.")
+        if panorama_log_max_wait_seconds is not None and panorama_log_max_wait_seconds < 1:
+            raise InputValidationError("--panorama-log-max-wait-seconds must be >= 1.")
+        if panorama_log_fetch_limit is not None and panorama_log_fetch_limit < 1:
+            raise InputValidationError("--panorama-log-fetch-limit must be >= 1.")
+        if panorama_log_max_results is not None and panorama_log_max_results < 1:
+            raise InputValidationError("--panorama-log-max-results must be >= 1.")
+
     source = select_data_source(settings, data_source)
 
     print(
@@ -215,10 +282,22 @@ def run_steps(
 
     path_result = path_tracing_step.run(validation, gateway)
 
+    if check_panorama_logs and resolved_panorama_host is not None and log_port is not None:
+        firewall_step = FirewallLogCheckStep()
+        firewall_logs = firewall_step.run(
+            settings,
+            panorama_host=resolved_panorama_host,
+            destination_port=log_port,
+            max_wait_seconds=panorama_log_max_wait_seconds,
+            fetch_limit=panorama_log_fetch_limit,
+            max_results=panorama_log_max_results,
+        )
+
     reached_destination = any(path.reached_destination for path in path_result.paths)
 
     payload = {
         "status": "success" if reached_destination else "failed",
+        "firewall_logs": firewall_logs,
         "source": {
             "input": source_input,
             "found_in_nautobot": validation.source_found,
@@ -295,6 +374,12 @@ def main(argv: list[str] | None = None) -> int:
             debug=args.debug,
             source_ip=args.source_ip,
             destination_ip=args.destination_ip,
+            check_panorama_logs=args.check_panorama_logs,
+            panorama_host=args.panorama_host,
+            log_port=args.log_port,
+            panorama_log_max_wait_seconds=args.panorama_log_max_wait_seconds,
+            panorama_log_fetch_limit=args.panorama_log_fetch_limit,
+            panorama_log_max_results=args.panorama_log_max_results,
             visualize_html=args.visualize_html,
             napalm_username=args.napalm_username,
             napalm_password=napalm_password,

@@ -1,7 +1,13 @@
 """Core package for modular network path tracing components."""
 
 from .config import NautobotAPISettings, NetworkPathSettings, PaloAltoSettings, NapalmSettings, F5Settings
-from .exceptions import GatewayDiscoveryError, InputValidationError, NextHopDiscoveryError, PathTracingError
+from .exceptions import (
+    GatewayDiscoveryError,
+    InputValidationError,
+    NextHopDiscoveryError,
+    PathTracingError,
+    FirewallLogCheckError,
+)
 from .interfaces.nautobot import (
     IPAddressRecord,
     PrefixRecord,
@@ -15,6 +21,7 @@ from .interfaces.nautobot_orm import NautobotORMDataSource
 from .interfaces.palo_alto import PaloAltoClient
 from .interfaces.f5_bigip import F5Client, F5NextHopSummary, F5APIError
 from .steps.gateway_discovery import GatewayDiscoveryResult, GatewayDiscoveryStep
+from .steps.firewall_log_check import FirewallLogCheckStep
 from .steps.input_validation import InputValidationResult, InputValidationStep
 from .steps.next_hop_discovery import NextHopDiscoveryResult, NextHopDiscoveryStep
 from .graph import NetworkPathGraph, build_pyvis_network
@@ -32,6 +39,7 @@ __all__ = [
     "GatewayDiscoveryError",
     "NextHopDiscoveryError",
     "PathTracingError",
+    "FirewallLogCheckError",
     "IPAddressRecord",
     "PrefixRecord",
     "DeviceRecord",
@@ -48,6 +56,7 @@ __all__ = [
     "InputValidationStep",
     "GatewayDiscoveryResult",
     "GatewayDiscoveryStep",
+    "FirewallLogCheckStep",
     "NextHopDiscoveryResult",
     "NextHopDiscoveryStep",
     "PathHop",

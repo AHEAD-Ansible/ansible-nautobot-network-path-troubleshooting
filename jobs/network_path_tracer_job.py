@@ -8,13 +8,17 @@ import subprocess
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
+from django import forms
 from django.core.exceptions import ObjectDoesNotExist, FieldError
-from nautobot.apps.jobs import BooleanVar, Job, ObjectVar, StringVar, register_jobs
+from django.utils.safestring import mark_safe
+from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar, register_jobs
+from nautobot.dcim.models import Device
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import CustomField, SecretsGroup
 from nautobot.extras.secrets.exceptions import SecretError
 
 from network_path_tracing import (  # Changed to absolute import
+    FirewallLogCheckStep,
     GatewayDiscoveryError,
     GatewayDiscoveryStep,
     InputValidationError,
@@ -30,6 +34,53 @@ from network_path_tracing import (  # Changed to absolute import
     build_pyvis_network,
 )
 from network_path_tracing.utils import resolve_target_to_ipv4
+
+
+class _FirewallLogToggleWidget(forms.CheckboxInput):
+    """Inject small JS helper to disable firewall log fields unless enabled."""
+
+    def render(self, name, value, attrs=None, renderer=None):  # noqa: ANN001
+        checkbox_html = super().render(name, value, attrs=attrs, renderer=renderer)
+        script = """
+<script>
+(function () {
+  function setDisabled(disabled) {
+    var fieldNames = [
+      "firewall_log_port",
+      "panorama_device",
+      "firewall_log_max_wait_seconds",
+      "firewall_log_fetch_limit",
+      "firewall_log_max_results"
+    ];
+    fieldNames.forEach(function (fieldName) {
+      var el = document.querySelector('[name="' + fieldName + '"]');
+      if (!el) {
+        return;
+      }
+      el.disabled = disabled;
+    });
+  }
+
+  function update() {
+    var toggle = document.querySelector('input[name="check_firewall_logs_in_path"]');
+    if (!toggle) {
+      return;
+    }
+    setDisabled(!toggle.checked);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var toggle = document.querySelector('input[name="check_firewall_logs_in_path"]');
+    if (!toggle) {
+      return;
+    }
+    toggle.addEventListener("change", update);
+    update();
+  });
+})();
+</script>
+"""
+        return mark_safe(f"{checkbox_html}{script}")
 
 
 @register_jobs
@@ -56,6 +107,12 @@ class NetworkPathTracerJob(Job):
             "secrets_group",
             "enable_layer2_discovery",
             "ping_endpoints",
+            "check_firewall_logs_in_path",
+            "firewall_log_port",
+            "firewall_log_max_wait_seconds",
+            "firewall_log_fetch_limit",
+            "firewall_log_max_results",
+            "panorama_device",
             "enable_debug_logging",
         ]
         # soft_time_limit / time_limit could be added if long-running
@@ -84,6 +141,53 @@ class NetworkPathTracerJob(Job):
         description="Ping the source and destination before tracing to refresh ARP/ND tables.",
         default=False,
     )
+    check_firewall_logs_in_path = BooleanVar(
+        label="Check Firewall Logs in Path (Panorama)",
+        description=(
+            "If enabled, query Panorama traffic logs for DENY entries matching src/dst and destination port "
+            "(last 24h, default max 10 results; see optional query tuning fields below)."
+        ),
+        default=False,
+        widget=_FirewallLogToggleWidget(),
+    )
+    firewall_log_port = StringVar(
+        label="Destination Port for Firewall Log Check",
+        description="Required when enabling firewall log check (0-65535).",
+        required=False,
+    )
+    firewall_log_max_wait_seconds = IntegerVar(
+        label="Panorama Log Query Max Wait (seconds)",
+        description="Optional: max seconds to wait for Panorama async traffic-log queries (default: 30).",
+        required=False,
+        default=30,
+        min_value=1,
+        max_value=600,
+    )
+    firewall_log_fetch_limit = IntegerVar(
+        label="Panorama Log Query Fetch Limit",
+        description=(
+            "Optional: number of matching traffic log rows to fetch before filtering for DENY "
+            "(higher may be slower; default: 10)."
+        ),
+        required=False,
+        default=10,
+        min_value=1,
+        max_value=500,
+    )
+    firewall_log_max_results = IntegerVar(
+        label="Max DENY Results",
+        description="Optional: maximum number of DENY log entries to return (default: 10).",
+        required=False,
+        default=10,
+        min_value=1,
+        max_value=50,
+    )
+    panorama_device = ObjectVar(
+        model=Device,
+        label="Panorama Device",
+        description="Required when enabling firewall log check; host derived from the device primary IP.",
+        required=False,
+    )
     enable_debug_logging = BooleanVar(
         description="Include debug-level log messages in the job output for troubleshooting.",
         default=False,
@@ -97,6 +201,12 @@ class NetworkPathTracerJob(Job):
         secrets_group: SecretsGroup,
         enable_layer2_discovery: bool = True,
         ping_endpoints: bool = False,
+        check_firewall_logs_in_path: bool = False,
+        firewall_log_port: str = "",
+        firewall_log_max_wait_seconds: Optional[int] = None,
+        firewall_log_fetch_limit: Optional[int] = None,
+        firewall_log_max_results: Optional[int] = None,
+        panorama_device: Optional[Device] = None,
         enable_debug_logging: bool = False,
         **kwargs,
     ) -> dict:
@@ -223,6 +333,51 @@ class NetworkPathTracerJob(Job):
             )
         )
 
+        panorama_host: Optional[str] = None
+        panorama_name: Optional[str] = None
+        firewall_destination_port: Optional[int] = None
+        firewall_max_wait_seconds: Optional[int] = None
+        firewall_fetch_limit: Optional[int] = None
+        firewall_max_results: Optional[int] = None
+        if check_firewall_logs_in_path:
+            port_raw = (firewall_log_port or "").strip()
+            if not port_raw:
+                self._fail_job(
+                    "Firewall log destination port is required when 'Check Firewall Logs in Path' is enabled."
+                )
+                return {}
+            try:
+                firewall_destination_port = int(port_raw)
+            except ValueError:
+                self._fail_job(
+                    f"Invalid firewall log destination port '{firewall_log_port}' (expected integer 0-65535)."
+                )
+                return {}
+            if firewall_destination_port < 0 or firewall_destination_port > 65535:
+                self._fail_job(
+                    f"Invalid firewall log destination port '{firewall_destination_port}' (expected integer 0-65535)."
+                )
+                return {}
+
+            firewall_max_wait_seconds = firewall_log_max_wait_seconds
+            firewall_fetch_limit = firewall_log_fetch_limit
+            firewall_max_results = firewall_log_max_results
+
+            if panorama_device is None:
+                self._fail_job(
+                    "Panorama device is required when 'Check Firewall Logs in Path' is enabled."
+                )
+                return {}
+
+            panorama_name = getattr(panorama_device, "name", None)
+            panorama_host = self._primary_ip_for_device(panorama_device)
+            if not panorama_host:
+                label = panorama_name or str(panorama_device)
+                self._fail_job(
+                    f"Panorama device '{label}' has no usable primary IP; set a primary IP in Nautobot."
+                )
+                return {}
+
         if ping_endpoints:
             self.logger.info("Pinging source and destination endpoints before tracing.")
             self._ping_endpoint("source", normalized_source)
@@ -269,6 +424,19 @@ class NetworkPathTracerJob(Job):
             path_result = path_tracing_step.run(validation, gateway)
             self.logger.success("Path tracing completed successfully")
 
+            firewall_logs = FirewallLogCheckStep.disabled_payload()
+            if check_firewall_logs_in_path and panorama_host and firewall_destination_port is not None:
+                firewall_step = FirewallLogCheckStep(logger=self.logger)
+                firewall_logs = firewall_step.run(
+                    settings,
+                    panorama_host=panorama_host,
+                    destination_port=firewall_destination_port,
+                    panorama_name=panorama_name,
+                    max_wait_seconds=firewall_max_wait_seconds,
+                    fetch_limit=firewall_fetch_limit,
+                    max_results=firewall_max_results,
+                )
+
             # Generate visualization if graph is available (optional dependency)
             visualization_attached = False
             if path_result.graph:
@@ -291,6 +459,7 @@ class NetworkPathTracerJob(Job):
             # Prepare result payload (JSON-serializable for JobResult.data)
             result_payload = {
                 "status": "success" if reached_destination else "failed",
+                "firewall_logs": firewall_logs,
                 "source": {
                     "input": source_input,
                     "found_in_nautobot": source_found,
@@ -379,6 +548,21 @@ class NetworkPathTracerJob(Job):
         if isinstance(value, str):
             return value.split("/")[0]
         return str(value).split("/")[0]
+
+    @staticmethod
+    def _primary_ip_for_device(device: Device) -> Optional[str]:
+        """Return the first usable primary IP from a Device (without any prefix)."""
+
+        for attribute in ("primary_ip4", "primary_ip", "primary_ip6"):
+            ip_obj = getattr(device, attribute, None)
+            if not ip_obj:
+                continue
+            candidate = getattr(ip_obj, "host", None) or getattr(ip_obj, "address", None) or str(ip_obj)
+            candidate = str(candidate).strip()
+            if not candidate:
+                continue
+            return candidate.split("/")[0]
+        return None
 
     def _ping_endpoint(self, label: str, ip_address: str) -> None:
         """Best-effort ICMP reachability check with logging."""

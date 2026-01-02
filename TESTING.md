@@ -44,10 +44,17 @@ Useful flags:
 |-----------|----------------|
 | `tests/test_steps.py` | End-to-end step workflow with a fake Nautobot data source. Includes success/edge cases for input validation, gateway fallback logic, next-hop data normalization, and BFS path tracing. |
 | `tests/test_interfaces_api.py` | REST data source behavior via the `responses` library. Verifies query parameters sent to Nautobot, enrichment of assigned objects, and gateway lookup fallbacks. |
+| `tests/test_panorama_xml_api_client.py` | Panorama XML API traffic log queries via the `responses` library: query parameter construction, sync vs job-id polling (`action=get`), XML parsing, and API key redaction in errors. |
+| `tests/test_firewall_log_check_step.py` | `FirewallLogCheckStep` payload contract (disabled/success/error) and redaction behavior, using `monkeypatch` to stub the underlying `PaloAltoClient`. |
+| `tests/test_cli_panorama_logs.py` | CLI payload wiring for the optional Panorama log check (`firewall_logs` presence and shape), using stubs/monkeypatches to keep the run offline. |
 | `tests/test_utils.py` | `resolve_target_to_ipv4()` happy-path and error handling (IPv6 rejection, hostname resolution failures). |
 | `tests/conftest.py` | Ensures the project root is importable so pytest can load the `jobs.network_path_tracing` modules without installation. |
 
-All automated tests are offline—no Nautobot instance or device access is required.
+#### Mocking HTTP with `responses`
+
+The unit tests avoid all outbound network calls by using the `responses` library to intercept `requests` HTTP calls and return canned JSON/XML bodies. This pattern is used for both Nautobot REST API tests (`tests/test_interfaces_api.py`) and Panorama XML API log query tests (`tests/test_panorama_xml_api_client.py`).
+
+All automated tests are offline—no Nautobot instance, Panorama instance, or device access is required.
 
 ---
 
@@ -60,6 +67,7 @@ These helpers live under `tests/` but are intended to be run manually after edit
 | `tests/gateway_source_l2_smoke.py` | Exercises layer-2 discovery from the default gateway toward the source endpoint. Stubs out Django/NetworkX when unavailable and reuses the actual workflow steps so you can validate LLDP/ARP behavior in isolation. |
 | `tests/f5_icontrol_api_smoke_test.py` | Queries BIG-IP iControl REST API to map a backend IP to pools, virtual servers, and SNAT decisions. Useful when tuning the `F5Client` logic. |
 | `tests/palo_api_smoke.py` | Minimal Palo Alto XML API client that authenticates, runs route/FIB lookups, and dumps raw XML responses for troubleshooting. |
+| `tests/panorama_traffic_log_smoke.py` | Queries Panorama traffic logs for a known DENY flow (src/dst/dport, last N hours) using the same `PaloAltoClient` as the Job/CLI. Useful for WP-007 lab validation when the feature returns “no logs”. |
 | `tests/napalm_nxos_probe.py` | Command-line probe for NX-OS devices via NAPALM (SSH or NX-API). Can capture SSH banners, open session logs, and fetch `get_route_to()` data without Nautobot. |
 
 Each script can be executed directly with `python tests/<script>.py`. They honor the credentials or constants defined at the top of the file and provide detailed debug output to help replicate lab issues.

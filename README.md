@@ -72,6 +72,7 @@ This repository ships a Nautobot Job that network operators can run on-demand to
 3. Optional toggles:
    - **Enable layer 2 discovery** – Tries to build an L2 chain (LLDP/ARP) between the gateway interface and the source endpoint.
    - **Ping endpoints** – Pings source and destination first to refresh ARP/ND caches before pulling routing data.
+   - **Check Firewall Logs in Path (Panorama)** – Queries Panorama traffic logs for **DENY** entries matching `source_ip`, `destination_ip`, and a user-provided **destination port** (last 24h, max 10 results). Requires **Destination Port for Firewall Log Check** and **Panorama Device** when enabled.
 4. Submit the job. Nautobot queues the execution; monitor the Job log for status updates.
 
 During execution the job will:
@@ -86,6 +87,7 @@ During execution the job will:
 ## Interpreting Results
 
 - **Job Data payload** – Stored in the optional custom field or printed in the log. Includes sections for `source`, `gateway`, `paths[]`, and any global `issues`.
+- **Firewall logs (`firewall_logs`)** – Always present for parity with the CLI. When enabled, `status` is `success` (queried successfully, even if `found=false`) or `error` (best-effort failure with safe messages in `errors[]`).
 - **Paths list** – Each element shows sequential hops with ingress interface, egress interface, next-hop IP, and descriptive text. Paths that reach the destination are marked with `reached_destination = true`.
 - **Issues** – Aggregated warnings such as “Device not found in Nautobot,” “Max hops exceeded,” or “Route lookup returned no next hop.”
 - **PyVis visualization** – If `graph.html` output is enabled via the CLI, or if you copy the serialized graph to the included template, you can render the traced path with the assets under `lib/`. (The Nautobot Job itself logs the serialized graph for later visualization.)
@@ -101,14 +103,28 @@ python jobs/network_path_tracing/cli.py \
   --data-source orm \
   --source-ip 10.100.100.100 \
   --destination-ip 10.200.200.200 \
-  --napalm-username admin \
+  --napalm-username <username> \
   --napalm-prompt-password \
   --visualize-html output/path.html
 ```
 
-- Use `--data-source api` to run against a remote Nautobot instance (requires `NAUTOBOT_API_URL`/`TOKEN`).  
+- Use `--data-source api` to run against a remote Nautobot instance (requires `NAUTOBOT_API_URL`/`NAUTOBOT_API_TOKEN`).  
 - `--debug` prints the normalized records and serialized graph.  
 - The CLI respects the same environment variables defined in `config.py`.
+
+### Optional: Panorama DENY log check (CLI)
+
+The CLI log check uses `PA_USERNAME`/`PA_PASSWORD` (values not shown) and requires `--panorama-host` (or `PANORAMA_HOST`) plus `--log-port`:
+
+```bash
+python jobs/network_path_tracing/cli.py \
+  --data-source orm \
+  --source-ip 10.100.100.100 \
+  --destination-ip 10.200.200.200 \
+  --check-panorama-logs \
+  --panorama-host panorama.example.com \
+  --log-port 443
+```
 
 ---
 
