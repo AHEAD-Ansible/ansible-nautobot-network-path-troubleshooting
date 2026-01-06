@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import importlib
 import logging
 import subprocess
 from dataclasses import replace
@@ -12,7 +13,7 @@ from django import forms
 from django.core.exceptions import ObjectDoesNotExist, FieldError
 from django.utils.safestring import mark_safe
 from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar, register_jobs
-from nautobot.dcim.models import Device
+from nautobot.dcim.models import Device, DeviceType
 from nautobot.extras.choices import JobResultStatusChoices, LogLevelChoices, SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import CustomField, SecretsGroup
 from nautobot.extras.secrets.exceptions import SecretError
@@ -34,6 +35,136 @@ from network_path_tracing import (  # Changed to absolute import
     build_pyvis_network,
 )
 from network_path_tracing.utils import resolve_target_to_ipv4
+
+
+def _panorama_device_type_ids() -> list[str]:
+    """Return in-use DeviceType IDs whose model contains 'panorama' (case-insensitive)."""
+
+    try:
+        return [
+            str(pk)
+            for pk in Device.objects.filter(device_type__model__icontains="panorama")
+            .values_list("device_type_id", flat=True)
+            .distinct()
+            if pk is not None
+        ]
+    except Exception:
+        return []
+
+
+def _panorama_device_type_natural_slugs() -> list[str]:
+    """Return DeviceType natural slugs whose model contains 'panorama' (case-insensitive)."""
+
+    try:
+        return [
+            slug
+            for slug in DeviceType.objects.filter(model__icontains="panorama").values_list("natural_slug", flat=True)
+            if slug
+        ]
+    except (FieldError, Exception):
+        return []
+
+
+def _resolve_device_type_filter_field() -> str:
+    """Return the Nautobot API filter parameter name for device type on dcim devices."""
+
+    def _filters_for(obj) -> set[str]:
+        get_filters = getattr(obj, "get_filters", None)
+        if callable(get_filters):
+            try:
+                return set(get_filters().keys())
+            except Exception:
+                return set()
+        base_filters = getattr(obj, "base_filters", None)
+        if isinstance(base_filters, dict):
+            return set(base_filters.keys())
+        return set()
+
+    candidates = []
+    try:
+        module = importlib.import_module("nautobot.dcim.api.views")
+        viewset = getattr(module, "DeviceViewSet", None)
+        if viewset is not None:
+            candidates.append(getattr(viewset, "filterset_class", None))
+    except Exception:
+        pass
+    try:
+        module = importlib.import_module("nautobot.dcim.filters")
+        candidates.append(getattr(module, "DeviceFilterSet", None))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        supported = _filters_for(candidate)
+        if "device_type_id" in supported:
+            return "device_type_id"
+        if "device_type" in supported:
+            return "device_type"
+
+    return "device_type_id"
+
+
+def _resolve_device_type_filter_expects_pk(filter_field: str) -> bool:
+    """Best-effort detection of whether the given filter expects DeviceType PK values."""
+
+    if filter_field == "device_type_id":
+        return True
+    if filter_field != "device_type":
+        return True
+
+    candidates = []
+    try:
+        module = importlib.import_module("nautobot.dcim.api.views")
+        viewset = getattr(module, "DeviceViewSet", None)
+        if viewset is not None:
+            candidates.append(getattr(viewset, "filterset_class", None))
+    except Exception:
+        pass
+    try:
+        module = importlib.import_module("nautobot.dcim.filters")
+        candidates.append(getattr(module, "DeviceFilterSet", None))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        get_filters = getattr(candidate, "get_filters", None)
+        if callable(get_filters):
+            try:
+                filters = get_filters()
+            except Exception:
+                continue
+            filter_obj = filters.get("device_type")
+            if filter_obj is None:
+                continue
+            return hasattr(filter_obj, "queryset")
+        base_filters = getattr(candidate, "base_filters", None)
+        if isinstance(base_filters, dict):
+            filter_obj = base_filters.get("device_type")
+            if filter_obj is None:
+                continue
+            return hasattr(filter_obj, "queryset")
+
+    return True
+
+
+_PANORAMA_DEVICE_TYPE_IDS = _panorama_device_type_ids()
+_PANORAMA_DEVICE_TYPE_SLUGS = _panorama_device_type_natural_slugs()
+_PANORAMA_DEVICE_TYPE_FILTER_FIELD = _resolve_device_type_filter_field()
+_PANORAMA_DEVICE_TYPE_FILTER_EXPECTS_PK = _resolve_device_type_filter_expects_pk(_PANORAMA_DEVICE_TYPE_FILTER_FIELD)
+_PANORAMA_DEVICE_QUERY_PARAMS: dict[str, str] = {}
+if _PANORAMA_DEVICE_TYPE_IDS:
+    if _PANORAMA_DEVICE_TYPE_FILTER_FIELD == "device_type":
+        if _PANORAMA_DEVICE_TYPE_FILTER_EXPECTS_PK:
+            token = _PANORAMA_DEVICE_TYPE_IDS[0]
+        else:
+            token = _PANORAMA_DEVICE_TYPE_SLUGS[0] if _PANORAMA_DEVICE_TYPE_SLUGS else _PANORAMA_DEVICE_TYPE_IDS[0]
+        _PANORAMA_DEVICE_QUERY_PARAMS = {"device_type": token}
+    else:
+        _PANORAMA_DEVICE_QUERY_PARAMS = {"device_type_id": _PANORAMA_DEVICE_TYPE_IDS[0]}
 
 
 class _FirewallLogToggleWidget(forms.CheckboxInput):
@@ -184,7 +315,7 @@ class NetworkPathTracerJob(Job):
     )
     panorama_device = ObjectVar(
         model=Device,
-        queryset=Device.objects.filter(device_type__model__icontains="panorama"),
+        query_params=_PANORAMA_DEVICE_QUERY_PARAMS,
         label="Panorama Device",
         description="Required when enabling firewall log check; host derived from the device primary IP.",
         required=False,
