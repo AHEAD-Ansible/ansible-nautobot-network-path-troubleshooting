@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import re
+import time
 import urllib.parse
 import urllib3
 import requests
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Iterable
+from typing import List, Optional, Dict, Iterable, Any
+
+from ..exceptions import FirewallLogCheckError
 
 
 def _parse_pan_xml(text: str) -> ET.Element:
@@ -15,14 +20,154 @@ def _parse_pan_xml(text: str) -> ET.Element:
     root = ET.fromstring(text)
     status = root.get("status")
     if status == "error":
-        msg = (
-            root.findtext(".//msg")
-            or root.findtext(".//line")
-            or root.findtext(".//message")
-            or "Unknown error"
+        msg_candidates = (
+            root.findtext(".//line"),
+            root.findtext(".//message"),
+            root.findtext(".//msg"),
         )
+        msg = next((candidate.strip() for candidate in msg_candidates if candidate and candidate.strip()), "Unknown error")
         raise RuntimeError(f"Palo Alto API error: {msg}")
     return root
+
+
+_PAN_API_KEY_QUERY_RE = re.compile(r"(\bkey=)[^&\s]+")
+
+
+def _redact_pan_api_key(text: str, api_key: Optional[str] = None) -> str:
+    """Redact API key material from arbitrary strings (URLs, exception messages)."""
+
+    redacted = _PAN_API_KEY_QUERY_RE.sub(r"\1***redacted***", text)
+    if api_key:
+        redacted = redacted.replace(api_key, "***redacted***")
+    return redacted
+
+
+def _sanitize_pan_api_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a shallow copy of params with secrets redacted."""
+
+    sanitized: Dict[str, Any] = dict(params)
+    if "key" in sanitized:
+        sanitized["key"] = "***redacted***"
+    return sanitized
+
+
+def _safe_port(value: Any) -> int:
+    """Return a validated destination port integer in [0, 65535]."""
+
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise FirewallLogCheckError(f"Invalid destination port '{value}' (expected integer 0-65535).") from exc
+    if port < 0 or port > 65535:
+        raise FirewallLogCheckError(f"Invalid destination port '{port}' (expected integer 0-65535).")
+    return port
+
+
+def _safe_ip_literal(value: Any, *, field: str) -> str:
+    """Return a validated IPv4/IPv6 literal string."""
+
+    if value is None:
+        raise FirewallLogCheckError(f"Invalid {field} IP: value is required.")
+    raw = str(value).strip()
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError as exc:
+        raise FirewallLogCheckError(f"Invalid {field} IP '{raw}'.") from exc
+
+
+def _safe_positive_int(value: Any, *, field: str) -> int:
+    """Return a validated positive integer (>=1)."""
+
+    try:
+        integer_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise FirewallLogCheckError(f"Invalid {field} '{value}' (expected integer).") from exc
+    if integer_value < 1:
+        raise FirewallLogCheckError(f"Invalid {field} '{integer_value}' (expected >= 1).")
+    return integer_value
+
+
+_PROTO_MAP = {
+    "6": "tcp",
+    "17": "udp",
+    "1": "icmp",
+}
+
+
+def _normalize_proto(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    candidate = value.strip().lower()
+    if not candidate:
+        return None
+    if candidate.isdigit():
+        return _PROTO_MAP.get(candidate, candidate)
+    return candidate
+
+
+def _safe_int_or_none(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        return int(candidate)
+    except ValueError:
+        return None
+
+
+def _find_traffic_logs_node(root: ET.Element) -> Optional[ET.Element]:
+    """Locate the <logs> node in a log query response."""
+
+    for xp in (
+        ".//result/log/logs",
+        ".//result//log//logs",
+        ".//log/logs",
+    ):
+        node = root.find(xp)
+        if node is not None:
+            return node
+    return None
+
+
+def _parse_traffic_log_entries(root: ET.Element) -> List[Dict[str, Any]]:
+    """Parse traffic log <entry> elements into normalized dicts."""
+
+    logs_node = _find_traffic_logs_node(root)
+    if logs_node is None:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for entry in logs_node.findall("./entry"):
+        timestamp = _find_first_text(entry, "./receive_time", ".//receive_time", "./time_generated", ".//time_generated")
+        action = _find_first_text(entry, "./action", ".//action")
+        source_ip = _find_first_text(entry, "./src", ".//src")
+        destination_ip = _find_first_text(entry, "./dst", ".//dst")
+        protocol = _normalize_proto(_find_first_text(entry, "./proto", ".//proto", "./protocol", ".//protocol"))
+        destination_port = _safe_int_or_none(_find_first_text(entry, "./dport", ".//dport", "./dstport", ".//dstport"))
+        rule = _find_first_text(entry, "./rule", ".//rule")
+        app = _find_first_text(entry, "./app", ".//app")
+        device_serial = _find_first_text(entry, "./serial", ".//serial")
+        device_name = _find_first_text(entry, "./device_name", ".//device_name")
+        session_end_reason = _find_first_text(entry, "./session_end_reason", ".//session_end_reason")
+
+        entries.append(
+            {
+                "timestamp": timestamp,
+                "action": action,
+                "source_ip": source_ip,
+                "destination_ip": destination_ip,
+                "protocol": protocol,
+                "destination_port": destination_port,
+                "rule": rule,
+                "app": app,
+                "device_serial": device_serial,
+                "device_name": device_name,
+                "session_end_reason": session_end_reason,
+            }
+        )
+    return entries
 
 
 def _first_text_from_nodes(nodes: Iterable[ET.Element]) -> Optional[str]:
@@ -595,3 +740,220 @@ class PaloAltoClient:
                 },
             )
         return entries
+
+    def traffic_logs_query(
+        self,
+        api_key: str,
+        *,
+        query: str,
+        nlogs: int = 10,
+        max_wait_seconds: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Query Panorama traffic logs via the XML API (type=log&log-type=traffic).
+
+        Handles both synchronous responses and async job-id polling.
+        """
+
+        if not isinstance(query, str) or not query.strip():
+            raise FirewallLogCheckError("Traffic log query must be a non-empty string.")
+
+        nlogs_int = _safe_positive_int(nlogs, field="nlogs")
+        max_wait_int = _safe_positive_int(max_wait_seconds, field="max_wait_seconds")
+
+        submit_params: Dict[str, Any] = {
+            "type": "log",
+            "log-type": "traffic",
+            "query": query,
+            "nlogs": str(nlogs_int),
+            "skip": "0",
+            "dir": "backward",
+            "key": api_key,
+        }
+
+        url = f"https://{self.host}/api/"
+        if self.logger:
+            self.logger.debug(
+                "Panorama traffic log query submit params=%s",
+                _sanitize_pan_api_params(submit_params),
+                extra={"grouping": "firewall-log-check"},
+            )
+
+        try:
+            response = self.session.get(url, params=submit_params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise FirewallLogCheckError(
+                f"Panorama traffic log query failed: {_redact_pan_api_key(str(exc), api_key=api_key)}"
+            ) from exc
+
+        if response.status_code >= 400:
+            raise FirewallLogCheckError(f"Panorama traffic log query failed: HTTP {response.status_code}.")
+
+        try:
+            root = _parse_pan_xml(response.text)
+        except ET.ParseError as exc:
+            raise FirewallLogCheckError(f"Panorama traffic log query failed: malformed XML ({exc}).") from exc
+        except RuntimeError as exc:
+            raise FirewallLogCheckError(_redact_pan_api_key(str(exc), api_key=api_key)) from exc
+
+        job_id = _find_first_text(root, ".//result/job", ".//job")
+        if job_id:
+            return self._poll_traffic_log_job(api_key, job_id, max_wait_seconds=max_wait_int)
+
+        logs_node = _find_traffic_logs_node(root)
+        if logs_node is None:
+            if self.logger:
+                self.logger.debug(
+                    "Unexpected Panorama log query response (no job id, no logs node).",
+                    extra={"grouping": "firewall-log-check"},
+                )
+            raise FirewallLogCheckError("Panorama traffic log query returned an unexpected response.")
+
+        entries = _parse_traffic_log_entries(root)
+        if self.logger:
+            self.logger.debug(
+                "Panorama traffic log query completed count=%s entries=%s",
+                logs_node.get("count"),
+                len(entries),
+                extra={"grouping": "firewall-log-check"},
+            )
+        return entries
+
+    def traffic_logs_deny_for_flow(
+        self,
+        api_key: str,
+        *,
+        src_ip: str,
+        dst_ip: str,
+        dst_port: Any,
+        since_hours: int = 24,
+        max_results: int = 10,
+        max_wait_seconds: int = 30,
+        fetch_limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query last-N-hours DENY traffic logs for an exact src/dst/dport flow."""
+
+        safe_src = _safe_ip_literal(src_ip, field="source")
+        safe_dst = _safe_ip_literal(dst_ip, field="destination")
+        safe_port = _safe_port(dst_port)
+        safe_hours = _safe_positive_int(since_hours, field="since_hours")
+        safe_max = _safe_positive_int(max_results, field="max_results")
+
+        safe_fetch = safe_max
+        if fetch_limit is not None:
+            safe_fetch = _safe_positive_int(fetch_limit, field="fetch_limit")
+
+        query = (
+            f"(receive_time in last-{safe_hours}-hrs) "
+            f"and (addr.src in {safe_src}) "
+            f"and (addr.dst in {safe_dst}) "
+            f"and (dport eq {safe_port})"
+        )
+        entries = self.traffic_logs_query(
+            api_key,
+            query=query,
+            nlogs=safe_fetch,
+            max_wait_seconds=max_wait_seconds,
+        )
+        deny_entries = [
+            entry
+            for entry in entries
+            if (entry.get("action") or "").strip().lower() == "deny"
+        ]
+        return deny_entries[:safe_max]
+
+    def _poll_traffic_log_job(
+        self,
+        api_key: str,
+        job_id: str,
+        *,
+        max_wait_seconds: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Poll a Panorama log query job until complete or timeout."""
+
+        started = time.monotonic()
+        poll_interval = 1.0
+
+        while True:
+            root = self._get_traffic_log_job_results(api_key, job_id)
+            logs_node = _find_traffic_logs_node(root)
+
+            progress: Optional[int] = None
+            if logs_node is not None:
+                progress_text = (logs_node.get("progress") or "").strip()
+                if progress_text.isdigit():
+                    progress = int(progress_text)
+                elif progress_text:
+                    try:
+                        progress = int(float(progress_text))
+                    except ValueError:
+                        progress = None
+
+            if self.logger:
+                self.logger.debug(
+                    "Panorama traffic log query job poll job_id=%s progress=%s count=%s",
+                    job_id,
+                    progress_text if logs_node is not None else None,
+                    logs_node.get("count") if logs_node is not None else None,
+                    extra={"grouping": "firewall-log-check"},
+                )
+
+            if progress is None and logs_node is not None:
+                progress = 100
+
+            if progress is not None and progress >= 100:
+                return _parse_traffic_log_entries(root)
+
+            if (time.monotonic() - started) >= max_wait_seconds:
+                entries = _parse_traffic_log_entries(root)
+                if entries:
+                    if self.logger:
+                        self.logger.debug(
+                            "Panorama traffic log query timed out but returned partial results job_id=%s progress=%s count=%s entries=%s",
+                            job_id,
+                            logs_node.get("progress") if logs_node is not None else None,
+                            logs_node.get("count") if logs_node is not None else None,
+                            len(entries),
+                            extra={"grouping": "firewall-log-check"},
+                        )
+                    return entries
+
+                raise FirewallLogCheckError(
+                    f"Panorama traffic log query timed out after {max_wait_seconds} seconds (job {job_id})."
+                )
+
+            time.sleep(poll_interval)
+            poll_interval = 2.0
+
+    def _get_traffic_log_job_results(self, api_key: str, job_id: str) -> ET.Element:
+        """Fetch log query results for a Panorama job-id (action=get)."""
+
+        params: Dict[str, Any] = {
+            "type": "log",
+            "action": "get",
+            "job-id": job_id,
+            "key": api_key,
+        }
+        url = f"https://{self.host}/api/"
+        if self.logger:
+            self.logger.debug(
+                "Panorama traffic log query get params=%s",
+                _sanitize_pan_api_params(params),
+                extra={"grouping": "firewall-log-check"},
+            )
+
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise FirewallLogCheckError(
+                f"Panorama traffic log query failed: {_redact_pan_api_key(str(exc), api_key=api_key)}"
+            ) from exc
+
+        if response.status_code >= 400:
+            raise FirewallLogCheckError(f"Panorama traffic log query failed: HTTP {response.status_code}.")
+
+        try:
+            return _parse_pan_xml(response.text)
+        except ET.ParseError as exc:
+            raise FirewallLogCheckError(f"Panorama traffic log query failed: malformed XML ({exc}).") from exc
+        except RuntimeError as exc:
+            raise FirewallLogCheckError(_redact_pan_api_key(str(exc), api_key=api_key)) from exc
