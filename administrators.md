@@ -87,7 +87,7 @@ tests/
 
 ### `jobs/network_path_tracing/graph`
 - `NetworkPathGraph` – Wrapper around `networkx.MultiDiGraph` with helpers for tagging start/destination nodes, merging attributes, and serializing nodes/edges to JSON.
-- `build_pyvis_network(graph)` – Renders the graph via PyVis for interactive viewing. Honors layer-2 edges (dashed) and color-codes start/source/destination nodes.
+- `build_pyvis_network(graph, firewall_logs=None, highlight_path=None, physics=False)` – Renders the graph via PyVis for interactive viewing. Honors layer-2 edges (dashed), color-codes nodes by role/error, and generates plain-text tooltips (no visible `<br>` artifacts). When `firewall_logs.entries` contains DENY entries, matching device nodes (by normalized `device_name`) render deny-red and get a “Firewall Logs (DENY)” summary section; node errors take precedence over deny highlighting.
 
 ### `jobs/network_path_tracing/utils.py`
 - `resolve_target_to_ipv4(value, field_label)` – Accepts IPs or hostnames, enforces IPv4-only behavior, and raises `InputValidationError` on missing/invalid inputs.
@@ -104,7 +104,7 @@ tests/
 
 - **Adding new device-specific logic** – Extend `NextHopDiscoveryStep` with additional platform detection (e.g., Juniper) and implement a helper similar to `_run_palo_alto_lookup()`. Keep the detection case-insensitive and rely on platform slug/name substrings.
 - **Changing default behavior** – Update constants in `config.py` (`_DEFAULT_SOURCE_IP`, `_DEFAULT_GATEWAY_CUSTOM_FIELD`, etc.). Any new settings should use the `_env_flag()/ _env_int()` helpers for consistency.
-- **Additional graph metadata** – `NetworkPathGraph.ensure_node()` and `add_edge()` accept arbitrary attributes; update `_process_state()` or `_add_source_node()` in `PathTracingStep` to annotate nodes for downstream visualization consumers.
+- **Additional graph metadata** – `NetworkPathGraph.ensure_node()` and `add_edge()` accept arbitrary attributes; update `_process_state()` or `_add_source_node()` in `PathTracingStep` to annotate nodes for downstream visualization consumers. For DENY highlighting/summary tooltips, device nodes should include `device_name` (matching Panorama `firewall_logs.entries[].device_name` after normalization) plus optional tooltip fields like `ip_address`, `interface`/`interfaces`, `redundancy_member`, and `blackhole`.
 
 ---
 

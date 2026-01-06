@@ -90,7 +90,7 @@ During execution the job will:
 - **Firewall logs (`firewall_logs`)** – Always present for parity with the CLI. When enabled, `status` is `success` (queried successfully, even if `found=false`) or `error` (best-effort failure with safe messages in `errors[]`).
 - **Paths list** – Each element shows sequential hops with ingress interface, egress interface, next-hop IP, and descriptive text. Paths that reach the destination are marked with `reached_destination = true`.
 - **Issues** – Aggregated warnings such as “Device not found in Nautobot,” “Max hops exceeded,” or “Route lookup returned no next hop.”
-- **PyVis visualization** – If `graph.html` output is enabled via the CLI, or if you copy the serialized graph to the included template, you can render the traced path with the assets under `lib/`. (The Nautobot Job itself logs the serialized graph for later visualization.)
+- **PyVis visualization** – The Nautobot Job attaches `network_path_trace.html` when graph rendering succeeds; the CLI writes the same HTML via `--visualize-html`. Firewall nodes with matching **DENY** logs render red and include a concise “Firewall Logs (DENY)” hover summary; all tooltips are plain text (no visible `<br>` artifacts).
 
 ---
 

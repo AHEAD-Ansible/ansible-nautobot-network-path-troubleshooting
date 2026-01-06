@@ -352,9 +352,27 @@ def run_steps(
     if visualize_html and path_result.graph and path_result.graph.graph.number_of_nodes() > 0:
         destination = Path(visualize_html).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        net = build_pyvis_network(path_result.graph)
-        net.save_graph(destination.as_posix())
-        payload.setdefault("visualization", {})["pyvis_html"] = destination.as_posix()
+        try:
+            import inspect
+
+            supports_firewall_logs = False
+            try:
+                supports_firewall_logs = "firewall_logs" in inspect.signature(build_pyvis_network).parameters
+            except (TypeError, ValueError):
+                supports_firewall_logs = False
+
+            if supports_firewall_logs:
+                try:
+                    net = build_pyvis_network(path_result.graph, firewall_logs=firewall_logs)
+                except Exception:
+                    net = build_pyvis_network(path_result.graph)
+            else:
+                net = build_pyvis_network(path_result.graph)
+
+            net.save_graph(destination.as_posix())
+            payload.setdefault("visualization", {})["pyvis_html"] = destination.as_posix()
+        except Exception as exc:
+            payload.setdefault("visualization", {})["pyvis_error"] = str(exc)
 
     return payload
 

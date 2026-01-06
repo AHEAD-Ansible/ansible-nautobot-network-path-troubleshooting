@@ -184,6 +184,7 @@ class NetworkPathTracerJob(Job):
     )
     panorama_device = ObjectVar(
         model=Device,
+        queryset=Device.objects.filter(device_type__model__icontains="panorama"),
         label="Panorama Device",
         description="Required when enabling firewall log check; host derived from the device primary IP.",
         required=False,
@@ -441,7 +442,27 @@ class NetworkPathTracerJob(Job):
             visualization_attached = False
             if path_result.graph:
                 try:
-                    net = build_pyvis_network(path_result.graph)
+                    import inspect
+
+                    supports_firewall_logs = False
+                    try:
+                        supports_firewall_logs = "firewall_logs" in inspect.signature(build_pyvis_network).parameters
+                    except (TypeError, ValueError):
+                        supports_firewall_logs = False
+
+                    if supports_firewall_logs:
+                        try:
+                            net = build_pyvis_network(path_result.graph, firewall_logs=firewall_logs)
+                        except Exception as exc:
+                            self.logger.warning(
+                                msg=(
+                                    "Visualization built without firewall log context: "
+                                    f"{exc}"
+                                )
+                            )
+                            net = build_pyvis_network(path_result.graph)
+                    else:
+                        net = build_pyvis_network(path_result.graph)
                     html = net.generate_html()
                     self.create_file("network_path_trace.html", html)  # Attach to JobResult
                     visualization_attached = True
